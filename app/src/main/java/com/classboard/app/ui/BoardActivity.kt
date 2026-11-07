@@ -39,6 +39,8 @@ class BoardActivity : Activity(), BoardView.Listener {
     private val io = Executors.newSingleThreadExecutor()
     private val main = Handler(Looper.getMainLooper())
 
+    private lateinit var rootLayout: FrameLayout
+    private var quickMenu: View? = null
     private lateinit var barWrap: LinearLayout
     private lateinit var subPanel: LinearLayout
     private lateinit var subScroll: HorizontalScrollView
@@ -68,6 +70,8 @@ class BoardActivity : Activity(), BoardView.Listener {
         board = BoardView(this)
         board.listener = this
         root.addView(board, FrameLayout.LayoutParams(-1, -1))
+        root.addView(board.overlay, FrameLayout.LayoutParams(-1, -1))
+        rootLayout = root
         buildToolbar(root)
         setContentView(root)
         hideSystemUi()
@@ -261,6 +265,14 @@ class BoardActivity : Activity(), BoardView.Listener {
                 }
             }
             Tool.ERASER -> {
+                val partial = Ui.button(this, "부분 지우기") {}
+                val whole = Ui.button(this, "획 통째로") {}
+                fun refresh() { Ui.setSelected(partial, !board.prefs.strokeEraser); Ui.setSelected(whole, board.prefs.strokeEraser) }
+                partial.setOnClickListener { board.prefs.strokeEraser = false; refresh() }
+                whole.setOnClickListener { board.prefs.strokeEraser = true; refresh() }
+                refresh()
+                subPanel.addView(partial); subPanel.addView(whole)
+                subPanel.addView(Ui.divider(this))
                 val sizes = listOf("작게" to 15f, "보통" to 30f, "크게" to 60f, "아주 크게" to 110f)
                 val btns = ArrayList<TextView>()
                 for ((label, r) in sizes) {
@@ -436,6 +448,85 @@ class BoardActivity : Activity(), BoardView.Listener {
     override fun onDocChanged() = scheduleSave()
 
     override fun onMessage(msg: String) { Toast.makeText(this, msg, Toast.LENGTH_SHORT).show() }
+
+    // ================================================================ 빠른 메뉴 (펜을 길게 누른 자리에)
+
+    private val quickMenuColors = intArrayOf(
+        Color.BLACK, Color.rgb(224, 49, 49), Color.rgb(25, 113, 194), Color.rgb(47, 158, 68),
+        Color.rgb(247, 103, 7), Color.rgb(156, 54, 181), Color.WHITE,
+    )
+
+    override fun onQuickMenu(x: Float, y: Float) {
+        dismissQuickMenu()
+        val catcher = FrameLayout(this).apply {
+            setBackgroundColor(0x14000000)
+            isClickable = true
+            setOnClickListener { dismissQuickMenu() }
+        }
+        val panel = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            val p = Ui.dpi(context, 10f); setPadding(p, p, p, p)
+            background = Ui.rounded(0xF8FFFFFF.toInt(), Ui.dp(context, 22f), Ui.dpi(context, 1f), 0xFFADB5BD.toInt())
+            elevation = Ui.dp(context, 12f)
+            isClickable = true   // 패널 안 빈 곳을 눌러도 닫히지 않게
+        }
+        // 1줄: 색 (누르면 바로 펜 + 그 색)
+        val colors = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER }
+        val curColor = if (board.tool == Tool.HIGHLIGHTER) board.hlColor else board.penColor
+        val dotColors = if (board.tool == Tool.HIGHLIGHTER) hlColors else quickMenuColors
+        for (c in dotColors) {
+            val d = Ui.colorDot(this, c) { v ->
+                if (board.tool != Tool.HIGHLIGHTER && board.tool != Tool.SHAPE) selectTool(Tool.PEN)
+                applyColor(v.tag as Int); dismissQuickMenu()
+            }
+            val sz = Ui.dpi(this, 60f)
+            d.layoutParams = LinearLayout.LayoutParams(sz, sz).apply { val m = Ui.dpi(this@BoardActivity, 6f); setMargins(m, m, m, m) }
+            Ui.setDot(d, c == curColor && board.tool != Tool.ERASER)
+            colors.addView(d)
+        }
+        panel.addView(colors)
+        // 2줄: 도구
+        val tools = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER }
+        fun tb(label: String, sel: Boolean, act: () -> Unit) = Ui.button(this, label, 18f) { act(); dismissQuickMenu() }.also { Ui.setSelected(it, sel); tools.addView(it) }
+        tb("✎ 펜", board.tool == Tool.PEN) { selectTool(Tool.PEN) }
+        tb("▍형광펜", board.tool == Tool.HIGHLIGHTER) { selectTool(Tool.HIGHLIGHTER) }
+        tb("⌫ 지우개", board.tool == Tool.ERASER) { selectTool(Tool.ERASER) }
+        tb("↶ 취소", false) { board.undo() }
+        tb("🗑 전체 지우기", false) { board.clearPage() }
+        panel.addView(tools)
+        // 3줄: 굵기
+        if (board.tool == Tool.PEN || board.tool == Tool.SHAPE) {
+            val widths = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER }
+            for ((label, w) in listOf("가늘게" to 2.5f, "보통" to 4f, "굵게" to 7f, "아주 굵게" to 12f)) {
+                val b = Ui.button(this, label, 16f) { board.penWidthPx = w; board.prefs.penWidth = w; dismissQuickMenu() }
+                Ui.setSelected(b, board.penWidthPx == w); widths.addView(b)
+            }
+            panel.addView(widths)
+        }
+        catcher.addView(panel, FrameLayout.LayoutParams(-2, -2))
+        rootLayout.addView(catcher, FrameLayout.LayoutParams(-1, -1))
+        quickMenu = catcher
+        // 크기를 안 뒤 누른 자리 위쪽(공간이 없으면 아래쪽)에 배치
+        panel.visibility = View.INVISIBLE
+        panel.post {
+            val gap = Ui.dp(this, 36f)
+            val w = panel.width.toFloat(); val h = panel.height.toFloat()
+            val maxX = rootLayout.width - w - 8f; val maxY = rootLayout.height - h - 8f
+            panel.x = (x - w / 2f).coerceIn(8f, maxX.coerceAtLeast(8f))
+            panel.y = (if (y - h - gap > 8f) y - h - gap else y + gap).coerceIn(8f, maxY.coerceAtLeast(8f))
+            panel.visibility = View.VISIBLE
+        }
+    }
+
+    private fun dismissQuickMenu() {
+        quickMenu?.let { rootLayout.removeView(it) }
+        quickMenu = null
+    }
+
+    override fun onBackPressed() {
+        if (quickMenu != null) { dismissQuickMenu(); return }
+        @Suppress("DEPRECATION") super.onBackPressed()
+    }
 
     // ================================================================ 자동 저장
 

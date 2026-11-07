@@ -17,8 +17,12 @@ class Prefs(context: Context) {
     /** 이 값 이상의 접촉 크기는 손바닥으로 판단 (touchMajor 값) */
     var palmThreshold: Float get() = f("palmThreshold", 60f); set(v) = put { putFloat("palmThreshold", v) }
 
-    /** 펜의 굵은 쪽(중간 접촉 크기)을 지우개로 사용 */
-    var thickEraser: Boolean get() = b("thickEraser", false); set(v) = put { putBoolean("thickEraser", v) }
+    /** 펜의 굵은 쪽(중간 접촉 크기) 동작: 0 일반 펜과 같음, 1 지우개, 2 두 번째 색 펜, 3 형광펜 */
+    var thickAction: Int
+        get() = i("thickAction", if (b("thickEraser", false)) 1 else 0)
+        set(v) = put { putInt("thickAction", v) }
+    /** 굵은 쪽으로 쓸 때의 색 (thickAction == 2) */
+    var thickColor: Int get() = i("thickColor", Color.rgb(224, 49, 49)); set(v) = put { putInt("thickColor", v) }
     var thickThreshold: Float get() = f("thickThreshold", 20f); set(v) = put { putFloat("thickThreshold", v) }
 
     /** 두 손가락으로 확대/이동 */
@@ -27,6 +31,17 @@ class Prefs(context: Context) {
     var holdToSnap: Boolean get() = b("holdToSnap", true); set(v) = put { putBoolean("holdToSnap", v) }
     /** 모든 획을 자동으로 도형 보정 */
     var autoShape: Boolean get() = b("autoShape", false); set(v) = put { putBoolean("autoShape", v) }
+
+    /** 손떨림 보정: 0 끔, 1 약하게, 2 강하게 */
+    var smoothing: Int get() = i("smoothing", 1); set(v) = put { putInt("smoothing", v) }
+    /** 펜 끝 위치 예측으로 지연 체감 줄이기 */
+    var prediction: Boolean get() = b("prediction", true); set(v) = put { putBoolean("prediction", v) }
+    /** 펜을 대고 0.5초 누르면 그 자리에 빠른 메뉴 (색/도구) */
+    var longPressMenu: Boolean get() = b("longPressMenu", true); set(v) = put { putBoolean("longPressMenu", v) }
+    /** 두 손가락으로 톡 치면 실행 취소 */
+    var twoFingerTapUndo: Boolean get() = b("twoFingerTapUndo", true); set(v) = put { putBoolean("twoFingerTapUndo", v) }
+    /** 지우개 도구: false 부분 지우기, true 획 전체 지우기 */
+    var strokeEraser: Boolean get() = b("strokeEraser", false); set(v) = put { putBoolean("strokeEraser", v) }
 
     /** 툴바 위치: 0 왼쪽, 1 가운데, 2 오른쪽 */
     var toolbarPos: Int get() = i("toolbarPos", 1); set(v) = put { putInt("toolbarPos", v) }

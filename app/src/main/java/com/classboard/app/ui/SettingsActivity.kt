@@ -53,12 +53,31 @@ class SettingsActivity : Activity() {
         palmSeek = seek(400, prefs.palmThreshold.toInt()) { prefs.palmThreshold = it.toFloat().coerceAtLeast(1f); updateLabels() }
         col.addView(palmSeek)
 
-        col.addView(switch("펜의 굵은 쪽을 지우개로 사용", prefs.thickEraser) { prefs.thickEraser = it })
+        col.addView(label("펜의 굵은 쪽으로 쓰면"))
+        col.addView(choice(listOf("일반 펜", "지우개", "두 번째 색", "형광펜"), prefs.thickAction) { prefs.thickAction = it })
+        col.addView(label("두 번째 색 (굵은 쪽)"))
+        val thickColors = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+        val tc = intArrayOf(Color.rgb(224, 49, 49), Color.rgb(25, 113, 194), Color.rgb(47, 158, 68), Color.rgb(247, 103, 7), Color.rgb(156, 54, 181), Color.BLACK, Color.WHITE)
+        val tDots = ArrayList<View>()
+        for (c in tc) {
+            val d = Ui.colorDot(this, c) { v -> prefs.thickColor = v.tag as Int; tDots.forEach { Ui.setDot(it, it.tag == prefs.thickColor) } }
+            Ui.setDot(d, c == prefs.thickColor); tDots += d; thickColors.addView(d)
+        }
+        col.addView(thickColors)
         thickLabel = label("")
         col.addView(thickLabel)
         thickSeek = seek(400, prefs.thickThreshold.toInt()) { prefs.thickThreshold = it.toFloat().coerceAtLeast(1f); updateLabels() }
         col.addView(thickSeek)
 
+        col.addView(title("필기감"))
+        col.addView(label("손떨림 보정 (IR 칠판의 선 떨림을 줄임)"))
+        col.addView(choice(listOf("끔", "약하게", "강하게"), prefs.smoothing) { prefs.smoothing = it })
+        col.addView(switch("펜 끝 예측 (선이 펜을 더 바짝 따라옴)", prefs.prediction) { prefs.prediction = it })
+
+        col.addView(title("편의 기능"))
+        col.addView(switch("펜을 대고 길게 누르면 그 자리에 색·도구 메뉴", prefs.longPressMenu) { prefs.longPressMenu = it })
+        col.addView(switch("두 손가락으로 톡 치면 실행 취소", prefs.twoFingerTapUndo) { prefs.twoFingerTapUndo = it })
+        col.addView(switch("지우개: 닿은 획을 통째로 지우기", prefs.strokeEraser) { prefs.strokeEraser = it })
         col.addView(switch("두 손가락으로 확대 / 이동", prefs.twoFingerZoom) { prefs.twoFingerZoom = it })
         col.addView(switch("그리고 잠시 멈추면 도형으로 보정", prefs.holdToSnap) { prefs.holdToSnap = it })
         col.addView(switch("모든 획을 자동으로 도형 보정", prefs.autoShape) { prefs.autoShape = it })
@@ -133,6 +152,17 @@ class SettingsActivity : Activity() {
         text = s; textSize = 19f; isChecked = v
         setPadding(0, Ui.dpi(context, 10f), 0, Ui.dpi(context, 10f))
         setOnCheckedChangeListener { _: CompoundButton, c: Boolean -> on(c) }
+    }
+
+    /** 여러 개 중 하나 고르기 버튼 줄 */
+    private fun choice(labels: List<String>, current: Int, on: (Int) -> Unit): View {
+        val row = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+        val btns = ArrayList<TextView>()
+        labels.forEachIndexed { i, l ->
+            val b = Ui.button(this, l) { on(i); btns.forEachIndexed { j, o -> Ui.setSelected(o, j == i) } }
+            Ui.setSelected(b, i == current); btns += b; row.addView(b)
+        }
+        return row
     }
 
     private fun seek(maxV: Int, v: Int, on: (Int) -> Unit) = SeekBar(this).apply {

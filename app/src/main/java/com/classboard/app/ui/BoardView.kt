@@ -16,6 +16,7 @@ import android.view.View
 import com.classboard.app.Prefs
 import com.classboard.app.ink.FloatBuf
 import com.classboard.app.ink.Geometry
+import com.classboard.app.ink.InkFilter
 import com.classboard.app.ink.ShapeRecognizer
 import com.classboard.app.model.NoteDocument
 import com.classboard.app.model.Page
@@ -28,6 +29,7 @@ import com.classboard.app.tools.MathTool
 import com.classboard.app.tools.Protractor
 import com.classboard.app.tools.Ruler
 import com.classboard.app.tools.ToolDrag
+import java.util.WeakHashMap
 import java.util.concurrent.Executors
 import kotlin.math.abs
 import kotlin.math.hypot
@@ -44,12 +46,17 @@ enum class ShapeType(val label: String) {
 /**
  * PDF 한 쪽과 필기를 그리고, 전자칠판 터치 입력을 처리하는 뷰.
  *
- * 레이어 구성 (아래→위)
+ * 필기 반응 속도를 위해 화면을 두 겹으로 나눈다.
+ *  - BoardView(정적 레이어, 하드웨어 레이어로 캐시): 배경, PDF, 확정된 필기
+ *  - overlay(실시간 레이어): 지금 그리는 획, 도형 미리보기, 수학 도구, 지우개 커서
+ * 펜이 움직일 때는 overlay 만 다시 그리므로 PDF/필기 비트맵을 매 프레임 다시 합성하지 않는다.
+ *
+ * 정적 레이어 구성 (아래→위)
  *  1. 페이지 배경 (흰색/칠판색 + 모눈 등)
  *  2. pdfFull   : 페이지 전체를 낮은 해상도로 렌더 (이동 중 빈 곳 방지)
  *  3. pdfScreen : 현재 화면 배율로 선명하게 렌더 (화면 크기 비트맵)
- *  4. ink       : 확정된 획을 화면 크기 비트맵에 캐시 (필기 속도 확보)
- *  5. 현재 그리는 획, 수학 도구, 지우개 커서
+ *  4. ink       : 확정된 획을 화면 크기 비트맵에 캐시
+ *  5. pending   : 방금 확정된 획 (잠시 벡터로 그리다가 쉴 때 ink 비트맵에 합침)
  */
 class BoardView(context: Context) : View(context) {
 
@@ -58,10 +65,17 @@ class BoardView(context: Context) : View(context) {
         fun onHistoryChanged(canUndo: Boolean, canRedo: Boolean)
         fun onDocChanged()
         fun onMessage(msg: String)
+        /** 펜을 대고 길게 누름 → 그 자리에 빠른 메뉴 */
+        fun onQuickMenu(x: Float, y: Float)
     }
 
     var listener: Listener? = null
     val prefs = Prefs(context)
+
+    /** 실시간 레이어. 액티비티가 BoardView 바로 위에 붙인다 (터치는 통과). */
+    val overlay: View = object : View(context) {
+        override fun onDraw(canvas: Canvas) = drawOverlay(canvas)
+    }
 
     // ---------------- 도구 상태
     var tool = Tool.PEN
@@ -97,6 +111,7 @@ class BoardView(context: Context) : View(context) {
     private class Op(val page: Page, val before: List<Stroke>, val after: List<Stroke>)
     private val undoStack = ArrayDeque<Op>()
     private val redoStack = ArrayDeque<Op>()
+    val canUndo get() = undoStack.isNotEmpty()
 
     // ---------------- 화면 변환 (페이지 좌표 → 화면 픽셀)
     private val viewMatrix = Matrix()
@@ -126,10 +141,17 @@ class BoardView(context: Context) : View(context) {
     private var inkVer = -1
     private var inkPage = -1
     private var inkDirty = true
+    /** ink 비트맵에 아직 합치지 않은 최근 획 */
+    private val pending = ArrayList<Stroke>()
+    private val flushRunnable = Runnable { flushPending() }
+
+    /** 획별 Path 캐시 (매 프레임 Path 를 새로 만들지 않도록) */
+    private val pathCache = WeakHashMap<Stroke, Path>()
 
     // ---------------- 페인트
     private val bmpPaint = Paint(Paint.FILTER_BITMAP_FLAG or Paint.DITHER_FLAG)
     private val strokePaint = Paint()
+    private val livePaint = Paint()
     private val bgPaint = Paint()
     private val gridPaint = Paint(Paint.ANTI_ALIAS_FLAG)
     private val axisText = Paint(Paint.ANTI_ALIAS_FLAG).apply { textAlign = Paint.Align.CENTER }
@@ -139,6 +161,17 @@ class BoardView(context: Context) : View(context) {
     private val labelText = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = Color.WHITE; textAlign = Paint.Align.CENTER; textSize = 40f }
     private val shadowPaint = Paint().apply { color = Color.argb(60, 0, 0, 0) }
     private val path = Path()
+    private val livePath = Path()
+    private val tailPath = Path()
+
+    init {
+        setLayerType(LAYER_TYPE_HARDWARE, null)
+        overlay.isClickable = false
+        overlay.isFocusable = false
+    }
+
+    private fun invalidateLive() = overlay.invalidate()
+    private fun invalidateAll() { invalidate(); overlay.invalidate() }
 
     // ================================================================ 문서 열기 / 페이지 이동
 
@@ -161,12 +194,12 @@ class BoardView(context: Context) : View(context) {
     private fun onPageSwitched() {
         pdfFull?.recycle(); pdfFull = null; pdfFullPage = -1
         pdfScreenPage = -1
-        inkDirty = true
+        inkDirty = true; pending.clear()
         if (width > 0) fitPage() else matrixVer++
         renderFull()
         listener?.onPageChanged(pageIndex, pageCount)
         notifyHistory()
-        invalidate()
+        invalidateAll()
     }
 
     /** 현재 쪽 뒤에 빈 페이지 추가 */
@@ -174,7 +207,6 @@ class BoardView(context: Context) : View(context) {
         val d = doc ?: return
         val cur = currentPage
         val p = if (cur != null && !cur.isBlank) {
-            // PDF 쪽과 같은 비율의 빈 페이지 (가로형 자료면 가로형)
             if (cur.width >= cur.height) Page.blank(pattern, bg) else Page(-1, Page.BLANK_H, Page.BLANK_W, pattern, bg)
         } else Page.blank(pattern, bg)
         d.pages.add(pageIndex + 1, p)
@@ -206,25 +238,29 @@ class BoardView(context: Context) : View(context) {
         invalidate()
     }
 
+    /** 현재 페이지 전체 지우기 (실행 취소 가능) */
     fun clearPage() {
         val p = currentPage ?: return
         if (p.strokes.isEmpty()) return
-        applyChange(p, emptyList())
+        val before = p.strokes
+        p.strokes = emptyList()
+        pushOp(Op(p, before, p.strokes))
+        strokesReplaced()
     }
 
     // ================================================================ 실행취소
 
-    private fun applyChange(p: Page, after: List<Stroke>, record: Boolean = true) {
-        val before = p.strokes
-        p.strokes = after
-        if (record) {
-            undoStack.addLast(Op(p, before, after))
-            while (undoStack.size > 200) undoStack.removeFirst()
-            redoStack.clear()
-        }
-        inkDirty = true
+    private fun pushOp(op: Op) {
+        undoStack.addLast(op)
+        while (undoStack.size > 300) undoStack.removeFirst()
+        redoStack.clear()
         listener?.onDocChanged()
         notifyHistory()
+    }
+
+    /** 획 목록이 통째로 바뀜 → 잉크 캐시 다시 만들기 */
+    private fun strokesReplaced() {
+        inkDirty = true; pending.clear()
         invalidate()
     }
 
@@ -245,10 +281,9 @@ class BoardView(context: Context) : View(context) {
     private fun showOpPage(p: Page) {
         val idx = doc?.pages?.indexOfFirst { it === p } ?: -1
         if (idx >= 0 && idx != pageIndex) goToPage(idx)
-        inkDirty = true
+        strokesReplaced()
         listener?.onDocChanged()
         notifyHistory()
-        invalidate()
     }
 
     private fun notifyHistory() = listener?.onHistoryChanged(undoStack.isNotEmpty(), redoStack.isNotEmpty())
@@ -288,7 +323,7 @@ class BoardView(context: Context) : View(context) {
     private fun matrixChanged() {
         viewMatrix.invert(inverse)
         matrixVer++
-        invalidate()
+        invalidateAll()
     }
 
     /** 페이지가 화면 밖으로 완전히 사라지지 않도록 */
@@ -339,10 +374,10 @@ class BoardView(context: Context) : View(context) {
     }
 
     private fun requestScreenRender() {
-        val src = pdf ?: return
+        if (pdf == null) return
         val p = currentPage ?: return
         if (p.isBlank || width <= 0 || height <= 0) return
-        if (screenRenderPending) { main.removeCallbacks(screenRenderRunnable) }
+        if (screenRenderPending) main.removeCallbacks(screenRenderRunnable)
         screenRenderPending = true
         main.postDelayed(screenRenderRunnable, 60)
     }
@@ -381,67 +416,59 @@ class BoardView(context: Context) : View(context) {
         }
     }
 
-    // ================================================================ 그리기
+    // ================================================================ 정적 레이어 그리기
+
+    /** 지우는 중/이동 중에는 잉크 비트맵 대신 벡터로 직접 그린다 */
+    private val vectorInk get() = mode == Mode.GESTURE || mode == Mode.ERASE
 
     override fun onDraw(canvas: Canvas) {
         canvas.drawColor(Color.rgb(0x49, 0x50, 0x57))
         val p = currentPage ?: return
 
         val pageRect = RectF(0f, 0f, p.width, p.height)
-        // 그림자
         val sr = RectF(pageRect); viewMatrix.mapRect(sr); sr.offset(6f, 6f)
         canvas.drawRect(sr, shadowPaint)
 
         canvas.save()
         canvas.concat(viewMatrix)
         canvas.clipRect(pageRect)
-        drawBackground(canvas, p)
-        if (!p.isBlank) {
-            pdfFull?.takeIf { pdfFullPage == pageIndex }?.let { b ->
-                canvas.save(); canvas.scale(1f / pdfFullScale, 1f / pdfFullScale)
-                canvas.drawBitmap(b, 0f, 0f, bmpPaint); canvas.restore()
-            }
-            pdfScreen?.takeIf { pdfScreenPage == pageIndex }?.let { b ->
-                canvas.save(); canvas.concat(pdfScreenMatrixInv)
-                canvas.drawBitmap(b, 0f, 0f, if (pdfScreenVer == matrixVer) null else bmpPaint); canvas.restore()
+        val sharp = !p.isBlank && pdfScreen != null && pdfScreenPage == pageIndex && pdfScreenVer == matrixVer
+        if (sharp) {
+            // 선명한 렌더가 화면과 정확히 맞으면 그것만 그린다 (겹쳐 그리기 최소화)
+            canvas.save(); canvas.concat(pdfScreenMatrixInv)
+            canvas.drawBitmap(pdfScreen!!, 0f, 0f, null); canvas.restore()
+        } else {
+            drawBackground(canvas, p)
+            if (!p.isBlank) {
+                pdfFull?.takeIf { pdfFullPage == pageIndex }?.let { b ->
+                    canvas.save(); canvas.scale(1f / pdfFullScale, 1f / pdfFullScale)
+                    canvas.drawBitmap(b, 0f, 0f, bmpPaint); canvas.restore()
+                }
+                pdfScreen?.takeIf { pdfScreenPage == pageIndex }?.let { b ->
+                    canvas.save(); canvas.concat(pdfScreenMatrixInv)
+                    canvas.drawBitmap(b, 0f, 0f, bmpPaint); canvas.restore()
+                }
             }
         }
         canvas.restore()
 
-        // 확정된 잉크
-        if (mode == Mode.GESTURE) {
+        if (vectorInk) {
             canvas.save(); canvas.concat(viewMatrix); canvas.clipRect(pageRect)
-            for (s in p.strokes) drawStroke(canvas, s)
+            val vis = visiblePageRect()
+            for (s in p.strokes) if (RectF.intersects(vis, s.bounds)) drawStroke(canvas, s)
             canvas.restore()
         } else {
             ensureInk(p)
             ink?.let { canvas.drawBitmap(it, 0f, 0f, null) }
+            if (pending.isNotEmpty()) {
+                canvas.save(); canvas.concat(viewMatrix); canvas.clipRect(pageRect)
+                for (s in pending) drawStroke(canvas, s)
+                canvas.restore()
+            }
         }
-
-        // 그리는 중인 획 / 미리보기
-        canvas.save(); canvas.concat(viewMatrix)
-        drawLive(canvas)
-        val s = currentScale()
-        for (t in mathTools.asReversed()) if (t.visible) t.draw(canvas, s)
-        canvas.restore()
-
-        // 지우개 커서 (화면 좌표)
-        if (eraserCursorR > 0f) {
-            canvas.drawCircle(eraserCursorX, eraserCursorY, eraserCursorR, cursorFill)
-            canvas.drawCircle(eraserCursorX, eraserCursorY, eraserCursorR, cursorPaint)
-        }
-        // 측정값 라벨
-        liveLabel?.let { drawLabel(canvas, it) }
     }
 
-    private fun drawLabel(c: Canvas, s: String) {
-        labelText.textSize = (resources.displayMetrics.density * 26f)
-        val tw = labelText.measureText(s)
-        val cx = width / 2f; val top = resources.displayMetrics.density * 16f
-        val pad = labelText.textSize * 0.6f
-        c.drawRoundRect(cx - tw / 2 - pad, top, cx + tw / 2 + pad, top + labelText.textSize + pad * 1.4f, pad, pad, labelBg)
-        c.drawText(s, cx, top + pad * 0.7f + labelText.textSize * 0.85f, labelText)
-    }
+    private fun visiblePageRect(): RectF = RectF(0f, 0f, width.toFloat(), height.toFloat()).also { inverse.mapRect(it) }
 
     private fun ensureInk(p: Page) {
         if (width <= 0 || height <= 0) return
@@ -457,26 +484,33 @@ class BoardView(context: Context) : View(context) {
         c.save()
         c.concat(viewMatrix)
         c.clipRect(0f, 0f, p.width, p.height)
-        val vis = RectF(0f, 0f, width.toFloat(), height.toFloat()); inverse.mapRect(vis)
+        val vis = visiblePageRect()
         for (s in p.strokes) if (RectF.intersects(vis, s.bounds)) drawStroke(c, s)
         c.restore()
         inkDirty = false; inkVer = matrixVer; inkPage = pageIndex
+        pending.clear()   // 전체 다시 그리기에 이미 포함됨
     }
 
-    /** 새 획 하나만 잉크 캐시에 추가 (전체 다시 그리기 회피) */
-    private fun appendToInk(s: Stroke) {
-        val c = inkCanvas ?: run { inkDirty = true; return }
-        if (inkDirty || inkVer != matrixVer || inkPage != pageIndex) { inkDirty = true; return }
-        val p = currentPage ?: return
-        c.save(); c.concat(viewMatrix); c.clipRect(0f, 0f, p.width, p.height)
-        drawStroke(c, s)
-        c.restore()
+    /** 쉬는 동안 최근 획들을 ink 비트맵에 합친다 (비트맵 업로드를 필기 중에 하지 않기 위해) */
+    private fun flushPending() {
+        if (pending.isEmpty()) return
+        if (mode != Mode.IDLE) { main.postDelayed(flushRunnable, 300); return }
+        val c = inkCanvas
+        val p = currentPage
+        if (c != null && p != null && !inkDirty && inkVer == matrixVer && inkPage == pageIndex) {
+            c.save(); c.concat(viewMatrix); c.clipRect(0f, 0f, p.width, p.height)
+            for (s in pending) drawStroke(c, s)
+            c.restore()
+        } else inkDirty = true
+        pending.clear()
+        invalidate()
     }
+
+    private fun pathOf(s: Stroke): Path = pathCache.getOrPut(s) { Geometry.buildPath(s.pts, s.pointCount, Path()) }
 
     private fun drawStroke(c: Canvas, s: Stroke) {
         Geometry.configurePaint(strokePaint, s.kind, s.color, s.width, s.dashed)
-        Geometry.buildPath(s.pts, s.pointCount, path)
-        c.drawPath(path, strokePaint)
+        c.drawPath(pathOf(s), strokePaint)
     }
 
     private fun drawBackground(c: Canvas, p: Page) {
@@ -539,17 +573,66 @@ class BoardView(context: Context) : View(context) {
         c.drawText("x", p.width - u * 0.5f, oy - u * 0.35f, axisText)
     }
 
+    // ================================================================ 실시간 레이어 그리기
+
+    private fun drawOverlay(canvas: Canvas) {
+        val p = currentPage ?: return
+        canvas.save()
+        canvas.concat(viewMatrix)
+        canvas.save()
+        canvas.clipRect(0f, 0f, p.width, p.height)
+        drawLive(canvas)
+        canvas.restore()
+        val s = currentScale()
+        for (t in mathTools.asReversed()) if (t.visible) t.draw(canvas, s)
+        canvas.restore()
+
+        if (eraserCursorR > 0f) {
+            canvas.drawCircle(eraserCursorX, eraserCursorY, eraserCursorR, cursorFill)
+            canvas.drawCircle(eraserCursorX, eraserCursorY, eraserCursorR, cursorPaint)
+        }
+        liveLabel?.let { drawLabel(canvas, it) }
+    }
+
+    private fun drawLabel(c: Canvas, s: String) {
+        labelText.textSize = (resources.displayMetrics.density * 26f)
+        val tw = labelText.measureText(s)
+        val cx = width / 2f; val top = resources.displayMetrics.density * 16f
+        val pad = labelText.textSize * 0.6f
+        c.drawRoundRect(cx - tw / 2 - pad, top, cx + tw / 2 + pad, top + labelText.textSize + pad * 1.4f, pad, pad, labelBg)
+        c.drawText(s, cx, top + pad * 0.7f + labelText.textSize * 0.85f, labelText)
+    }
+
     private fun drawLive(c: Canvas) {
+        if (mode == Mode.DRAW && live.points > 0) {
+            Geometry.configurePaint(livePaint, liveKind, liveColor, liveWidth, liveDashed)
+            if (liveKind == StrokeKind.HIGHLIGHTER || liveDashed || snapped) {
+                // 반투명/점선은 한 경로로 그려야 겹침 얼룩이 없다
+                Geometry.buildPath(live.data, live.points, path)
+                c.drawPath(path, livePaint)
+            } else {
+                c.drawPath(livePath, livePaint)
+                // 마지막 중간점 → 마지막 점 → 예측 위치
+                val n = live.points
+                tailPath.rewind()
+                // livePath 는 n>=3 일 때 마지막 중간점까지 이어져 있다 (buildPath 와 동일)
+                if (n >= 3) tailPath.moveTo((live.x(n - 2) + live.x(n - 1)) / 2f, (live.y(n - 2) + live.y(n - 1)) / 2f)
+                else tailPath.moveTo(live.x(0), live.y(0))
+                tailPath.lineTo(live.x(n - 1) + if (n == 1) 0.01f else 0f, live.y(n - 1))
+                if (hasPrediction) tailPath.lineTo(predX, predY)
+                c.drawPath(tailPath, livePaint)
+            }
+            return
+        }
         val pts: FloatArray = when {
             toolDrag != null -> toolDrag?.points() ?: return
             mode == Mode.SHAPE -> shapePreview ?: return
-            mode == Mode.DRAW && live.points > 0 -> { Geometry.configurePaint(strokePaint, liveKind, liveColor, liveWidth, dashed); Geometry.buildPath(live.data, live.points, path); c.drawPath(path, strokePaint); return }
             else -> return
         }
-        if (toolDrag != null && tool == Tool.HIGHLIGHTER) Geometry.configurePaint(strokePaint, StrokeKind.HIGHLIGHTER, hlColor, hlWidthPx / currentScale(), false)
-        else Geometry.configurePaint(strokePaint, StrokeKind.PEN, penColor, penWidthPage(), shapeDashed())
+        if (toolDrag != null && tool == Tool.HIGHLIGHTER) Geometry.configurePaint(livePaint, StrokeKind.HIGHLIGHTER, hlColor, hlWidthPx / currentScale(), false)
+        else Geometry.configurePaint(livePaint, StrokeKind.PEN, penColor, penWidthPage(), shapeDashed())
         Geometry.buildPath(pts, pts.size / 2, path)
-        c.drawPath(path, strokePaint)
+        c.drawPath(path, livePaint)
     }
 
     // ================================================================ 터치 입력
@@ -557,23 +640,37 @@ class BoardView(context: Context) : View(context) {
     private enum class Mode { IDLE, DRAW, ERASE, GESTURE, TOOL, SHAPE, IGNORE }
 
     private var mode = Mode.IDLE
+        set(v) {
+            if (field == v) return
+            val wasVector = field == Mode.GESTURE || field == Mode.ERASE
+            field = v
+            val isVector = v == Mode.GESTURE || v == Mode.ERASE
+            // 이동/지우기 중에는 정적 레이어가 매 프레임 바뀌므로 하드웨어 레이어를 잠시 끈다
+            if (isVector != wasVector) setLayerType(if (isVector) LAYER_TYPE_NONE else LAYER_TYPE_HARDWARE, null)
+        }
     private var activeId = -1
     private val live = FloatBuf()
+    private val filter = InkFilter()
     private var liveKind = StrokeKind.PEN
     private var liveColor = Color.BLACK
     private var liveWidth = 4f
+    private var liveDashed = false
     private var downTime = 0L
     private var downX = 0f; private var downY = 0f
     private var lastSX = 0f; private var lastSY = 0f
+    private var maxTravel = 0f
     private var moveEvents = 0
     private var snapped = false
     private var liveLabel: String? = null
+    private var hasPrediction = false
+    private var predX = 0f; private var predY = 0f
 
     private var toolDrag: ToolDrag? = null
     private var shapeStart = FloatArray(2)
     private var shapePreview: FloatArray? = null
 
     private var eraseBefore: List<Stroke>? = null
+    private var eraseWhole = false
     private var eraserR = 0f
     private var eraserCursorX = 0f; private var eraserCursorY = 0f; private var eraserCursorR = 0f
     private var lastEraseX = 0f; private var lastEraseY = 0f
@@ -582,10 +679,13 @@ class BoardView(context: Context) : View(context) {
     private val gStart = Matrix()
     private var g0x = 0f; private var g0y = 0f; private var gDist = 1f
     private var gId0 = -1; private var gId1 = -1
+    private var gTime = 0L
+    private var gMoved = 0f
 
-    // 멈춤 감지(도형 보정)
+    // 멈춤 감지(도형 보정), 길게 누르기(빠른 메뉴)
     private var holdAnchorX = 0f; private var holdAnchorY = 0f
     private val holdRunnable = Runnable { onHold() }
+    private val longPressRunnable = Runnable { onLongPress() }
 
     private fun contactSize(e: MotionEvent, idx: Int): Float {
         val tm = e.getTouchMajor(idx)
@@ -606,38 +706,52 @@ class BoardView(context: Context) : View(context) {
             MotionEvent.ACTION_POINTER_DOWN -> onPointerDown(e)
             MotionEvent.ACTION_MOVE -> onMove(e)
             MotionEvent.ACTION_POINTER_UP -> onPointerUp(e)
-            MotionEvent.ACTION_UP -> { onUp(e, false); mode = Mode.IDLE }
-            MotionEvent.ACTION_CANCEL -> { onUp(e, true); mode = Mode.IDLE }
+            MotionEvent.ACTION_UP -> { onUp(e, false); mode = Mode.IDLE; scheduleFlush() }
+            MotionEvent.ACTION_CANCEL -> { onUp(e, true); mode = Mode.IDLE; scheduleFlush() }
         }
         return true
     }
 
+    private fun scheduleFlush() {
+        main.removeCallbacks(flushRunnable)
+        if (pending.isNotEmpty()) main.postDelayed(flushRunnable, 350)
+    }
+
     private fun onDown(e: MotionEvent) {
+        main.removeCallbacks(flushRunnable)
         activeId = e.getPointerId(0)
         val sx = e.x; val sy = e.y
         downTime = SystemClock.uptimeMillis()
         downX = sx; downY = sy; lastSX = sx; lastSY = sy
-        moveEvents = 0; snapped = false
+        maxTravel = 0f; moveEvents = 0; snapped = false; hasPrediction = false
         val size = contactSize(e, 0)
 
-        if (prefs.palmErase && size >= prefs.palmThreshold) { startErase(sx, sy, palmRadius(size)); return }
-        if (prefs.thickEraser && size >= prefs.thickThreshold) { startErase(sx, sy, eraserRadiusPx); return }
+        if (prefs.palmErase && size >= prefs.palmThreshold) { startErase(sx, sy, palmRadius(size), false); return }
+
+        // 펜의 굵은 쪽
+        val thick = prefs.thickAction != 0 && size >= prefs.thickThreshold
+        if (thick && prefs.thickAction == 1) { startErase(sx, sy, eraserRadiusPx, prefs.strokeEraser); scheduleLongPress(); return }
 
         val pp = toPage(sx, sy)
         val px = pp[0]; val py = pp[1]
-        // 수학 도구 조작이 우선
         val s = currentScale()
-        for (t in mathTools) {
+        // 수학 도구 조작이 우선
+        if (!thick) for (t in mathTools) {
             if (!t.visible) continue
             val d = t.hit(px, py, s) ?: continue
             toolDrag = d; mode = Mode.TOOL
             d.move(px, py)
             liveLabel = d.label()
-            invalidate(); return
+            invalidateLive(); return
         }
 
-        when (tool) {
-            Tool.ERASER -> startErase(sx, sy, eraserRadiusPx)
+        val effTool = when {
+            thick && prefs.thickAction == 2 -> Tool.PEN
+            thick && prefs.thickAction == 3 -> Tool.HIGHLIGHTER
+            else -> tool
+        }
+        when (effTool) {
+            Tool.ERASER -> startErase(sx, sy, eraserRadiusPx, prefs.strokeEraser)
             Tool.SHAPE -> {
                 mode = Mode.SHAPE
                 shapeStart[0] = px; shapeStart[1] = py
@@ -645,16 +759,38 @@ class BoardView(context: Context) : View(context) {
             }
             Tool.PEN, Tool.HIGHLIGHTER -> {
                 mode = Mode.DRAW
-                val hl = tool == Tool.HIGHLIGHTER
+                val hl = effTool == Tool.HIGHLIGHTER
                 liveKind = if (hl) StrokeKind.HIGHLIGHTER else StrokeKind.PEN
-                liveColor = if (hl) hlColor else penColor
+                liveColor = when { hl -> hlColor; thick -> prefs.thickColor; else -> penColor }
                 liveWidth = (if (hl) hlWidthPx else penWidthPx) / s
+                liveDashed = dashed && !hl
+                filter.strength = prefs.smoothing
+                filter.start(sx, sy, e.eventTime)
                 live.clear(); live.add(px, py)
+                livePath.rewind(); livePath.moveTo(px, py)
                 holdAnchorX = sx; holdAnchorY = sy
                 scheduleHold()
             }
         }
-        invalidate()
+        scheduleLongPress()
+        invalidateLive()
+    }
+
+    private fun scheduleLongPress() {
+        main.removeCallbacks(longPressRunnable)
+        if (prefs.longPressMenu) main.postDelayed(longPressRunnable, 520)
+    }
+
+    /** 펜을 대고 움직이지 않고 누르고 있으면 → 그 자리에 빠른 메뉴 */
+    private fun onLongPress() {
+        if (maxTravel > 14f) return
+        if (mode != Mode.DRAW && mode != Mode.SHAPE && mode != Mode.ERASE) return
+        main.removeCallbacks(holdRunnable)
+        if (mode == Mode.ERASE) endErase()
+        live.clear(); livePath.rewind(); shapePreview = null; hasPrediction = false
+        mode = Mode.IGNORE
+        invalidateAll()
+        listener?.onQuickMenu(downX, downY)
     }
 
     private fun palmRadius(size: Float) = (size * 0.6f).coerceIn(28f, 240f)
@@ -663,16 +799,16 @@ class BoardView(context: Context) : View(context) {
         when (mode) {
             Mode.DRAW, Mode.SHAPE, Mode.IDLE -> {
                 // 막 시작한 획이면 두 손가락 제스처로 전환
-                val young = SystemClock.uptimeMillis() - downTime < 300 || hypot(lastSX - downX, lastSY - downY) < 30f
-                if (prefs.twoFingerZoom && young) {
-                    live.clear(); shapePreview = null; main.removeCallbacks(holdRunnable)
-                    startGesture(e)
+                val young = SystemClock.uptimeMillis() - downTime < 300 || maxTravel < 30f
+                if (prefs.twoFingerZoom || prefs.twoFingerTapUndo) {
+                    if (young) {
+                        main.removeCallbacks(holdRunnable); main.removeCallbacks(longPressRunnable)
+                        live.clear(); livePath.rewind(); shapePreview = null; hasPrediction = false
+                        startGesture(e)
+                    }
                 }
             }
-            Mode.TOOL -> {
-                // 도구 이동 중 두 번째 손가락은 무시
-            }
-            Mode.ERASE, Mode.GESTURE, Mode.IGNORE -> {}
+            Mode.TOOL, Mode.ERASE, Mode.GESTURE, Mode.IGNORE -> {}
         }
     }
 
@@ -684,16 +820,22 @@ class BoardView(context: Context) : View(context) {
         g0x = (e.getX(i0) + e.getX(i1)) / 2f; g0y = (e.getY(i0) + e.getY(i1)) / 2f
         gDist = hypot(e.getX(i0) - e.getX(i1), e.getY(i0) - e.getY(i1)).coerceAtLeast(1f)
         gStart.set(viewMatrix)
-        invalidate()
+        gTime = SystemClock.uptimeMillis(); gMoved = 0f
+        invalidateAll()
     }
 
     private fun onMove(e: MotionEvent) {
+        val idxA = e.findPointerIndex(activeId)
+        if (idxA >= 0) maxTravel = max(maxTravel, hypot(e.getX(idxA) - downX, e.getY(idxA) - downY))
+        if (maxTravel > 14f) main.removeCallbacks(longPressRunnable)
         when (mode) {
             Mode.GESTURE -> {
                 val i0 = e.findPointerIndex(gId0); val i1 = e.findPointerIndex(gId1)
                 if (i0 < 0 || i1 < 0) return
                 val mx = (e.getX(i0) + e.getX(i1)) / 2f; val my = (e.getY(i0) + e.getY(i1)) / 2f
                 val d = hypot(e.getX(i0) - e.getX(i1), e.getY(i0) - e.getY(i1)).coerceAtLeast(1f)
+                gMoved = max(gMoved, max(hypot(mx - g0x, my - g0y), abs(d - gDist)))
+                if (!prefs.twoFingerZoom) return
                 var k = d / gDist
                 val startScale = gStart.mapRadius(1f)
                 k = (startScale * k).coerceIn(fitScale * 0.5f, fitScale * 8f) / startScale
@@ -704,9 +846,8 @@ class BoardView(context: Context) : View(context) {
             }
             Mode.DRAW -> moveDraw(e)
             Mode.ERASE -> {
-                val idx = e.findPointerIndex(activeId).takeIf { it >= 0 } ?: return
-                // 손바닥이 넓어지면 지우개도 커짐
-                if (prefs.palmErase) {
+                val idx = idxA.takeIf { it >= 0 } ?: return
+                if (prefs.palmErase && !eraseWhole) {
                     val size = contactSize(e, idx)
                     if (size >= prefs.palmThreshold) eraserR = max(eraserR, palmRadius(size))
                 }
@@ -714,18 +855,18 @@ class BoardView(context: Context) : View(context) {
                 eraseAlong(e.getX(idx), e.getY(idx))
             }
             Mode.TOOL -> {
-                val idx = e.findPointerIndex(activeId).takeIf { it >= 0 } ?: return
+                val idx = idxA.takeIf { it >= 0 } ?: return
                 val pp = toPage(e.getX(idx), e.getY(idx))
                 toolDrag?.move(pp[0], pp[1])
                 liveLabel = toolDrag?.label()
-                invalidate()
+                invalidateLive()
             }
             Mode.SHAPE -> {
-                val idx = e.findPointerIndex(activeId).takeIf { it >= 0 } ?: return
+                val idx = idxA.takeIf { it >= 0 } ?: return
                 lastSX = e.getX(idx); lastSY = e.getY(idx)
                 val pp = toPage(lastSX, lastSY)
                 shapePreview = buildShape(shapeStart[0], shapeStart[1], pp[0], pp[1])
-                invalidate()
+                invalidateLive()
             }
             else -> {}
         }
@@ -738,26 +879,41 @@ class BoardView(context: Context) : View(context) {
         if (moveEvents <= 6 && prefs.palmErase) {
             val size = contactSize(e, idx)
             if (size >= prefs.palmThreshold) {
-                live.clear(); main.removeCallbacks(holdRunnable)
-                startErase(e.getX(idx), e.getY(idx), palmRadius(size)); return
+                live.clear(); livePath.rewind(); hasPrediction = false
+                main.removeCallbacks(holdRunnable); main.removeCallbacks(longPressRunnable)
+                startErase(e.getX(idx), e.getY(idx), palmRadius(size), false)
+                invalidateLive(); return
             }
         }
         if (snapped) return
-        val minD = 1.2f
-        for (h in 0 until e.historySize) addLivePoint(e.getHistoricalX(idx, h), e.getHistoricalY(idx, h), minD)
-        addLivePoint(e.getX(idx), e.getY(idx), minD)
+        for (h in 0 until e.historySize) {
+            filter.add(e.getHistoricalX(idx, h), e.getHistoricalY(idx, h), e.getHistoricalEventTime(h))
+            addLivePoint(filter.x, filter.y)
+        }
+        filter.add(e.getX(idx), e.getY(idx), e.eventTime)
+        addLivePoint(filter.x, filter.y)
+        if (prefs.prediction && liveKind == StrokeKind.PEN) {
+            val (ax, ay) = filter.predict(18f, 36f)
+            val pp = toPage(ax, ay); predX = pp[0]; predY = pp[1]; hasPrediction = true
+        } else hasPrediction = false
         if (hypot(lastSX - holdAnchorX, lastSY - holdAnchorY) > 10f) {
             holdAnchorX = lastSX; holdAnchorY = lastSY
             scheduleHold()
         }
-        invalidate()
+        invalidateLive()
     }
 
-    private fun addLivePoint(sx: Float, sy: Float, minD: Float) {
-        if (abs(sx - lastSX) < minD && abs(sy - lastSY) < minD) return
+    private fun addLivePoint(sx: Float, sy: Float) {
+        if (abs(sx - lastSX) < 1f && abs(sy - lastSY) < 1f) return
         lastSX = sx; lastSY = sy
         val pp = toPage(sx, sy)
         live.add(pp[0], pp[1])
+        // Path 를 이어 붙이기만 한다 (buildPath 와 같은 곡선)
+        val n = live.points
+        if (n >= 3) {
+            val x = live.x(n - 2); val y = live.y(n - 2)
+            livePath.quadTo(x, y, (x + live.x(n - 1)) / 2f, (y + live.y(n - 1)) / 2f)
+        }
     }
 
     private fun scheduleHold() {
@@ -767,13 +923,13 @@ class BoardView(context: Context) : View(context) {
 
     /** 펜을 멈추고 있으면 도형으로 보정 */
     private fun onHold() {
-        if (mode != Mode.DRAW || snapped || live.points < 4) return
+        if (mode != Mode.DRAW || snapped || live.points < 4 || maxTravel < 20f) return
         val r = ShapeRecognizer.recognize(live.toArray()) ?: return
         live.set(r.pts)
-        snapped = true
+        snapped = true; hasPrediction = false
         liveLabel = r.name
-        invalidate()
-        main.postDelayed({ if (liveLabel == r.name) { liveLabel = null; invalidate() } }, 900)
+        invalidateLive()
+        main.postDelayed({ if (liveLabel == r.name) { liveLabel = null; invalidateLive() } }, 900)
     }
 
     private fun onPointerUp(e: MotionEvent) {
@@ -781,13 +937,23 @@ class BoardView(context: Context) : View(context) {
         if (mode == Mode.GESTURE && (id == gId0 || id == gId1)) {
             endGesture()
             mode = Mode.IGNORE   // 남은 손가락으로 획이 그어지지 않도록
-        } else if (id == activeId && mode != Mode.GESTURE) {
+        } else if (id == activeId && mode != Mode.GESTURE && mode != Mode.IGNORE) {
             onUp(e, false)
             mode = Mode.IGNORE
         }
     }
 
     private fun endGesture() {
+        // 두 손가락으로 톡 → 실행 취소
+        val tap = SystemClock.uptimeMillis() - gTime < 280 && gMoved < 22f
+        if (tap && prefs.twoFingerTapUndo) {
+            viewMatrix.set(gStart)
+            matrixChanged()
+            if (canUndo) { undo(); liveLabel = "↶ 실행 취소" } else liveLabel = "취소할 것이 없습니다"
+            main.postDelayed({ liveLabel = null; invalidateLive() }, 700)
+            invalidateAll()
+            return
+        }
         clampPan()
         matrixChanged()
         inkDirty = true
@@ -796,18 +962,28 @@ class BoardView(context: Context) : View(context) {
 
     private fun onUp(e: MotionEvent, cancel: Boolean) {
         main.removeCallbacks(holdRunnable)
+        main.removeCallbacks(longPressRunnable)
         val p = currentPage ?: return
+        hasPrediction = false
         when (mode) {
             Mode.DRAW -> {
                 if (!cancel && live.points >= 1) {
+                    // 필터 지연으로 끝이 짧아지지 않도록 실제 펜을 뗀 위치를 마지막 점으로
+                    if (!snapped && prefs.smoothing > 0) {
+                        val idx = e.findPointerIndex(activeId)
+                        if (idx >= 0) addLivePoint(e.getX(idx), e.getY(idx))
+                    }
                     var pts = live.toArray()
+                    var shaped = snapped
                     if (!snapped && prefs.autoShape && pts.size >= 6) {
-                        ShapeRecognizer.recognize(pts)?.let { pts = it.pts }
+                        ShapeRecognizer.recognize(pts)?.let { pts = it.pts; shaped = true }
                     }
                     if (pts.size == 2) pts = floatArrayOf(pts[0], pts[1], pts[0] + 0.01f, pts[1])
-                    commitStroke(p, Stroke(liveKind, liveColor, liveWidth, dashed && liveKind == StrokeKind.PEN, Geometry.densify(pts, max(2f / currentScale(), liveWidth * 0.5f))))
+                    // 도형은 꼭짓점이 둥글어지지 않도록 촘촘히, 손글씨는 그대로 (그린 모양 그대로 저장)
+                    if (shaped) pts = Geometry.densify(pts, 3f / currentScale())
+                    commitStroke(p, Stroke(liveKind, liveColor, liveWidth, liveDashed, pts))
                 }
-                live.clear()
+                live.clear(); livePath.rewind()
             }
             Mode.SHAPE -> {
                 val pts = shapePreview
@@ -833,38 +1009,38 @@ class BoardView(context: Context) : View(context) {
             Mode.GESTURE -> endGesture()
             else -> {}
         }
-        if (liveLabel != null && !snapped) liveLabel = null
-        if (snapped) main.postDelayed({ liveLabel = null; invalidate() }, 600)
-        invalidate()
+        if (liveLabel != null && !snapped && mode != Mode.GESTURE) liveLabel = null
+        if (snapped) main.postDelayed({ liveLabel = null; invalidateLive() }, 600)
+        invalidateLive()
     }
 
     private fun commitStroke(p: Page, s: Stroke) {
         val before = p.strokes
         p.strokes = before + s
-        undoStack.addLast(Op(p, before, p.strokes))
-        while (undoStack.size > 200) undoStack.removeFirst()
-        redoStack.clear()
-        appendToInk(s)
-        listener?.onDocChanged()
-        notifyHistory()
+        pending += s
+        pushOp(Op(p, before, p.strokes))
+        invalidate()
     }
 
     fun cancelInput() {
-        main.removeCallbacks(holdRunnable)
-        live.clear(); shapePreview = null; toolDrag = null; liveLabel = null
+        main.removeCallbacks(holdRunnable); main.removeCallbacks(longPressRunnable)
+        live.clear(); livePath.rewind(); shapePreview = null; toolDrag = null; liveLabel = null; hasPrediction = false
         if (mode == Mode.ERASE) endErase()
         mode = Mode.IDLE
         eraserCursorR = 0f
+        invalidateLive()
     }
 
     // ---------------- 지우개
 
-    private fun startErase(sx: Float, sy: Float, r: Float) {
+    private fun startErase(sx: Float, sy: Float, r: Float, whole: Boolean) {
         mode = Mode.ERASE
         eraseBefore = currentPage?.strokes
+        eraseWhole = whole
         eraserR = r
         lastEraseX = sx; lastEraseY = sy
         eraseAt(sx, sy)
+        invalidate()
     }
 
     private fun eraseAlong(sx: Float, sy: Float) {
@@ -883,20 +1059,24 @@ class BoardView(context: Context) : View(context) {
 
     private fun eraseAt(sx: Float, sy: Float, cursor: Boolean = true) {
         val p = currentPage ?: return
-        if (cursor) { eraserCursorX = sx; eraserCursorY = sy; eraserCursorR = eraserR }
+        if (cursor) { eraserCursorX = sx; eraserCursorY = sy; eraserCursorR = eraserR; invalidateLive() }
         val pp = toPage(sx, sy)
         val r = eraserR / currentScale()
         var changed = false
         val out = ArrayList<Stroke>(p.strokes.size + 4)
         for (s in p.strokes) {
             val res = Geometry.erase(s, pp[0], pp[1], r)
-            if (res == null) out += s else { out.addAll(res); changed = true }
+            when {
+                res == null -> out += s
+                eraseWhole -> changed = true              // 닿은 획 통째로 삭제
+                else -> { out.addAll(res); changed = true }
+            }
         }
         if (changed) {
             p.strokes = out
-            inkDirty = true
+            inkDirty = true; pending.clear()
+            invalidate()
         }
-        invalidate()
     }
 
     private fun endErase() {
@@ -904,12 +1084,9 @@ class BoardView(context: Context) : View(context) {
         val before = eraseBefore
         eraseBefore = null
         eraserCursorR = 0f
-        if (p != null && before != null && before !== p.strokes) {
-            undoStack.addLast(Op(p, before, p.strokes))
-            redoStack.clear()
-            listener?.onDocChanged()
-            notifyHistory()
-        }
+        invalidateLive()
+        if (p != null && before != null && before !== p.strokes) pushOp(Op(p, before, p.strokes))
+        invalidate()
     }
 
     // ---------------- 도형 도구
@@ -920,7 +1097,6 @@ class BoardView(context: Context) : View(context) {
         return when (shapeType) {
             ShapeType.LINE, ShapeType.DASH_LINE -> {
                 val (x1, y1) = Geometry.snapAngle(x0, y0, x1In, y1In)
-                liveLabel = null
                 Geometry.line(x0, y0, x1, y1)
             }
             ShapeType.ARROW -> {
@@ -972,12 +1148,12 @@ class BoardView(context: Context) : View(context) {
 
     /** 수학 도구를 현재 화면 가운데에 띄우거나 숨긴다 */
     fun toggleTool(t: MathTool): Boolean {
-        if (t.visible) { t.visible = false; invalidate(); return false }
+        if (t.visible) { t.visible = false; invalidateLive(); return false }
         val p = currentPage ?: return false
         val pp = toPage(width / 2f, (height - bottomInset) / 2f)
         t.placeAt(pp[0], pp[1], p.unit)
         t.visible = true
-        invalidate()
+        invalidateLive()
         return true
     }
 
