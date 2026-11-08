@@ -11,8 +11,8 @@ android {
         applicationId = "com.classboard.app"
         minSdk = 26          // Android 8.0 전자칠판 지원
         targetSdk = 34
-        versionCode = 1
-        versionName = "0.1.0"
+        versionCode = 3
+        versionName = "0.3.0"
     }
 
     buildTypes {

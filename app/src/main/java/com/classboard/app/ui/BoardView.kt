@@ -24,11 +24,6 @@ import com.classboard.app.model.Pattern
 import com.classboard.app.model.Stroke
 import com.classboard.app.model.StrokeKind
 import com.classboard.app.storage.PdfSource
-import com.classboard.app.tools.Compass
-import com.classboard.app.tools.MathTool
-import com.classboard.app.tools.Protractor
-import com.classboard.app.tools.Ruler
-import com.classboard.app.tools.ToolDrag
 import java.util.WeakHashMap
 import java.util.concurrent.Executors
 import kotlin.math.abs
@@ -36,12 +31,7 @@ import kotlin.math.hypot
 import kotlin.math.max
 import kotlin.math.min
 
-enum class Tool { PEN, HIGHLIGHTER, ERASER, SHAPE }
-
-enum class ShapeType(val label: String) {
-    LINE("직선"), ARROW("화살표"), DASH_LINE("점선"), RECT("사각형"), ELLIPSE("원·타원"),
-    TRIANGLE("삼각형"), RIGHT_TRIANGLE("직각삼각형"), AXES("좌표축"), NUMBER_LINE("수직선"),
-}
+enum class Tool { PEN, HIGHLIGHTER, ERASER }
 
 /**
  * PDF 한 쪽과 필기를 그리고, 전자칠판 터치 입력을 처리하는 뷰.
@@ -67,6 +57,8 @@ class BoardView(context: Context) : View(context) {
         fun onMessage(msg: String)
         /** 펜을 대고 길게 누름 → 그 자리에 빠른 메뉴 */
         fun onQuickMenu(x: Float, y: Float)
+        /** 판 위에 펜/손이 닿음 (툴바 자동 접기용) */
+        fun onTouchStart()
     }
 
     var listener: Listener? = null
@@ -85,12 +77,6 @@ class BoardView(context: Context) : View(context) {
     var hlWidthPx = prefs.hlWidth
     var eraserRadiusPx = prefs.eraserRadius
     var dashed = false
-    var shapeType = ShapeType.LINE
-
-    val ruler = Ruler()
-    val protractor = Protractor()
-    val compass = Compass()
-    private val mathTools: List<MathTool> = listOf(compass, protractor, ruler)
 
     /** 툴바가 가리는 아래쪽 높이 (페이지 맞춤 시 제외) */
     var bottomInset = 0
@@ -583,8 +569,6 @@ class BoardView(context: Context) : View(context) {
         canvas.clipRect(0f, 0f, p.width, p.height)
         drawLive(canvas)
         canvas.restore()
-        val s = currentScale()
-        for (t in mathTools.asReversed()) if (t.visible) t.draw(canvas, s)
         canvas.restore()
 
         if (eraserCursorR > 0f) {
@@ -622,22 +606,12 @@ class BoardView(context: Context) : View(context) {
                 if (hasPrediction) tailPath.lineTo(predX, predY)
                 c.drawPath(tailPath, livePaint)
             }
-            return
         }
-        val pts: FloatArray = when {
-            toolDrag != null -> toolDrag?.points() ?: return
-            mode == Mode.SHAPE -> shapePreview ?: return
-            else -> return
-        }
-        if (toolDrag != null && tool == Tool.HIGHLIGHTER) Geometry.configurePaint(livePaint, StrokeKind.HIGHLIGHTER, hlColor, hlWidthPx / currentScale(), false)
-        else Geometry.configurePaint(livePaint, StrokeKind.PEN, penColor, penWidthPage(), shapeDashed())
-        Geometry.buildPath(pts, pts.size / 2, path)
-        c.drawPath(path, livePaint)
     }
 
     // ================================================================ 터치 입력
 
-    private enum class Mode { IDLE, DRAW, ERASE, GESTURE, TOOL, SHAPE, IGNORE }
+    private enum class Mode { IDLE, DRAW, ERASE, GESTURE, SWIPE, IGNORE }
 
     private var mode = Mode.IDLE
         set(v) {
@@ -665,9 +639,9 @@ class BoardView(context: Context) : View(context) {
     private var hasPrediction = false
     private var predX = 0f; private var predY = 0f
 
-    private var toolDrag: ToolDrag? = null
-    private var shapeStart = FloatArray(2)
-    private var shapePreview: FloatArray? = null
+    // 세·네 손가락 쪽 넘기기
+    private var swipeStartX = 0f; private var swipeStartY = 0f
+    private var swipeDone = false
 
     private var eraseBefore: List<Stroke>? = null
     private var eraseWhole = false
@@ -696,8 +670,6 @@ class BoardView(context: Context) : View(context) {
         tmpPts[0] = sx; tmpPts[1] = sy; inverse.mapPoints(tmpPts); return tmpPts
     }
 
-    private fun penWidthPage() = penWidthPx / currentScale()
-    private fun shapeDashed() = dashed || (mode == Mode.SHAPE && shapeType == ShapeType.DASH_LINE)
 
     override fun onTouchEvent(e: MotionEvent): Boolean {
         if (currentPage == null) return false
@@ -724,6 +696,7 @@ class BoardView(context: Context) : View(context) {
         downTime = SystemClock.uptimeMillis()
         downX = sx; downY = sy; lastSX = sx; lastSY = sy
         maxTravel = 0f; moveEvents = 0; snapped = false; hasPrediction = false
+        listener?.onTouchStart()
         val size = contactSize(e, 0)
 
         if (prefs.palmErase && size >= prefs.palmThreshold) { startErase(sx, sy, palmRadius(size), false); return }
@@ -735,15 +708,6 @@ class BoardView(context: Context) : View(context) {
         val pp = toPage(sx, sy)
         val px = pp[0]; val py = pp[1]
         val s = currentScale()
-        // 수학 도구 조작이 우선
-        if (!thick) for (t in mathTools) {
-            if (!t.visible) continue
-            val d = t.hit(px, py, s) ?: continue
-            toolDrag = d; mode = Mode.TOOL
-            d.move(px, py)
-            liveLabel = d.label()
-            invalidateLive(); return
-        }
 
         val effTool = when {
             thick && prefs.thickAction == 2 -> Tool.PEN
@@ -752,11 +716,6 @@ class BoardView(context: Context) : View(context) {
         }
         when (effTool) {
             Tool.ERASER -> startErase(sx, sy, eraserRadiusPx, prefs.strokeEraser)
-            Tool.SHAPE -> {
-                mode = Mode.SHAPE
-                shapeStart[0] = px; shapeStart[1] = py
-                shapePreview = null
-            }
             Tool.PEN, Tool.HIGHLIGHTER -> {
                 mode = Mode.DRAW
                 val hl = effTool == Tool.HIGHLIGHTER
@@ -784,10 +743,10 @@ class BoardView(context: Context) : View(context) {
     /** 펜을 대고 움직이지 않고 누르고 있으면 → 그 자리에 빠른 메뉴 */
     private fun onLongPress() {
         if (maxTravel > 14f) return
-        if (mode != Mode.DRAW && mode != Mode.SHAPE && mode != Mode.ERASE) return
+        if (mode != Mode.DRAW && mode != Mode.ERASE) return
         main.removeCallbacks(holdRunnable)
         if (mode == Mode.ERASE) endErase()
-        live.clear(); livePath.rewind(); shapePreview = null; hasPrediction = false
+        live.clear(); livePath.rewind(); hasPrediction = false
         mode = Mode.IGNORE
         invalidateAll()
         listener?.onQuickMenu(downX, downY)
@@ -796,20 +755,57 @@ class BoardView(context: Context) : View(context) {
     private fun palmRadius(size: Float) = (size * 0.6f).coerceIn(28f, 240f)
 
     private fun onPointerDown(e: MotionEvent) {
+        // 세 손가락 이상 → 쪽 넘기기 (두 손가락 제스처 중이거나 막 시작한 획이어도)
+        if (e.pointerCount >= 3 && mode != Mode.ERASE && mode != Mode.SWIPE) {
+            val young = SystemClock.uptimeMillis() - downTime < 400 || maxTravel < 40f
+            if (mode == Mode.GESTURE || young) { startSwipe(e); return }
+        }
         when (mode) {
-            Mode.DRAW, Mode.SHAPE, Mode.IDLE -> {
+            Mode.DRAW, Mode.IDLE -> {
                 // 막 시작한 획이면 두 손가락 제스처로 전환
                 val young = SystemClock.uptimeMillis() - downTime < 300 || maxTravel < 30f
-                if (prefs.twoFingerZoom || prefs.twoFingerTapUndo) {
-                    if (young) {
-                        main.removeCallbacks(holdRunnable); main.removeCallbacks(longPressRunnable)
-                        live.clear(); livePath.rewind(); shapePreview = null; hasPrediction = false
-                        startGesture(e)
-                    }
+                if ((prefs.twoFingerZoom || prefs.twoFingerTapUndo) && young) {
+                    main.removeCallbacks(holdRunnable); main.removeCallbacks(longPressRunnable)
+                    live.clear(); livePath.rewind(); hasPrediction = false
+                    startGesture(e)
                 }
             }
-            Mode.TOOL, Mode.ERASE, Mode.GESTURE, Mode.IGNORE -> {}
+            Mode.ERASE, Mode.GESTURE, Mode.SWIPE, Mode.IGNORE -> {}
         }
+    }
+
+    private fun startSwipe(e: MotionEvent) {
+        main.removeCallbacks(holdRunnable); main.removeCallbacks(longPressRunnable)
+        if (mode == Mode.GESTURE) { viewMatrix.set(gStart); matrixChanged() }   // 확대 시작한 것 되돌리기
+        live.clear(); livePath.rewind(); hasPrediction = false
+        mode = Mode.SWIPE
+        swipeDone = false
+        swipeStartX = avgX(e); swipeStartY = avgY(e)
+        invalidateAll()
+    }
+
+    private fun avgX(e: MotionEvent): Float { var t = 0f; for (i in 0 until e.pointerCount) t += e.getX(i); return t / e.pointerCount }
+    private fun avgY(e: MotionEvent): Float { var t = 0f; for (i in 0 until e.pointerCount) t += e.getY(i); return t / e.pointerCount }
+
+    private fun onSwipeMove(e: MotionEvent) {
+        if (swipeDone) return
+        val dx = avgX(e) - swipeStartX; val dy = avgY(e) - swipeStartY
+        val need = min(width, height) * 0.08f
+        if (abs(dx) > need && abs(dx) > abs(dy) * 1.2f) {
+            swipeDone = true   // 한 번 쓸 때 한 쪽만
+            val target = if (dx < 0) pageIndex + 1 else pageIndex - 1
+            if (target in 0 until pageCount) {
+                goToPage(target)
+                mode = Mode.SWIPE   // goToPage 의 cancelInput 이 IDLE 로 바꾼 것 복원 (손 뗄 때까지 무시)
+                flashLabel("${pageIndex + 1} / $pageCount")
+            } else flashLabel(if (dx < 0) "마지막 쪽입니다" else "첫 쪽입니다")
+        }
+    }
+
+    private fun flashLabel(text: String) {
+        liveLabel = text
+        invalidateLive()
+        main.postDelayed({ if (liveLabel == text) { liveLabel = null; invalidateLive() } }, 800)
     }
 
     private fun startGesture(e: MotionEvent) {
@@ -854,20 +850,7 @@ class BoardView(context: Context) : View(context) {
                 for (h in 0 until e.historySize) eraseAlong(e.getHistoricalX(idx, h), e.getHistoricalY(idx, h))
                 eraseAlong(e.getX(idx), e.getY(idx))
             }
-            Mode.TOOL -> {
-                val idx = idxA.takeIf { it >= 0 } ?: return
-                val pp = toPage(e.getX(idx), e.getY(idx))
-                toolDrag?.move(pp[0], pp[1])
-                liveLabel = toolDrag?.label()
-                invalidateLive()
-            }
-            Mode.SHAPE -> {
-                val idx = idxA.takeIf { it >= 0 } ?: return
-                lastSX = e.getX(idx); lastSY = e.getY(idx)
-                val pp = toPage(lastSX, lastSY)
-                shapePreview = buildShape(shapeStart[0], shapeStart[1], pp[0], pp[1])
-                invalidateLive()
-            }
+            Mode.SWIPE -> onSwipeMove(e)
             else -> {}
         }
     }
@@ -916,6 +899,9 @@ class BoardView(context: Context) : View(context) {
         }
     }
 
+    /** 이보다 작은 획(일반 글씨 크기)은 부드러운 곡선 보정을 하지 않음 */
+    private fun minCurvePage() = 160f / currentScale()
+
     private fun scheduleHold() {
         main.removeCallbacks(holdRunnable)
         if (prefs.holdToSnap) main.postDelayed(holdRunnable, 650)
@@ -924,7 +910,7 @@ class BoardView(context: Context) : View(context) {
     /** 펜을 멈추고 있으면 도형으로 보정 */
     private fun onHold() {
         if (mode != Mode.DRAW || snapped || live.points < 4 || maxTravel < 20f) return
-        val r = ShapeRecognizer.recognize(live.toArray()) ?: return
+        val r = ShapeRecognizer.recognize(live.toArray(), minCurvePage()) ?: return
         live.set(r.pts)
         snapped = true; hasPrediction = false
         liveLabel = r.name
@@ -934,6 +920,7 @@ class BoardView(context: Context) : View(context) {
 
     private fun onPointerUp(e: MotionEvent) {
         val id = e.getPointerId(e.actionIndex)
+        if (mode == Mode.SWIPE) return   // 모든 손가락을 뗄 때까지 무시
         if (mode == Mode.GESTURE && (id == gId0 || id == gId1)) {
             endGesture()
             mode = Mode.IGNORE   // 남은 손가락으로 획이 그어지지 않도록
@@ -976,7 +963,7 @@ class BoardView(context: Context) : View(context) {
                     var pts = live.toArray()
                     var shaped = snapped
                     if (!snapped && prefs.autoShape && pts.size >= 6) {
-                        ShapeRecognizer.recognize(pts)?.let { pts = it.pts; shaped = true }
+                        ShapeRecognizer.recognize(pts, minCurvePage())?.let { pts = it.pts; shaped = true }
                     }
                     if (pts.size == 2) pts = floatArrayOf(pts[0], pts[1], pts[0] + 0.01f, pts[1])
                     // 도형은 꼭짓점이 둥글어지지 않도록 촘촘히, 손글씨는 그대로 (그린 모양 그대로 저장)
@@ -985,31 +972,11 @@ class BoardView(context: Context) : View(context) {
                 }
                 live.clear(); livePath.rewind()
             }
-            Mode.SHAPE -> {
-                val pts = shapePreview
-                if (!cancel && pts != null) {
-                    commitStroke(p, Stroke(StrokeKind.PEN, penColor, penWidthPage(), shapeDashed(), Geometry.densify(pts, 3f / currentScale())))
-                }
-                shapePreview = null
-            }
-            Mode.TOOL -> {
-                val d = toolDrag
-                if (!cancel && d != null && d.draws) {
-                    d.points()?.let {
-                        val dense = Geometry.densify(it, 3f / currentScale())
-                        // 형광펜 상태에서 자를 대고 그으면 형광펜 밑줄
-                        val st = if (tool == Tool.HIGHLIGHTER) Stroke(StrokeKind.HIGHLIGHTER, hlColor, hlWidthPx / currentScale(), false, dense)
-                        else Stroke(StrokeKind.PEN, penColor, penWidthPage(), dashed, dense)
-                        commitStroke(p, st)
-                    }
-                }
-                toolDrag = null
-            }
             Mode.ERASE -> endErase()
             Mode.GESTURE -> endGesture()
             else -> {}
         }
-        if (liveLabel != null && !snapped && mode != Mode.GESTURE) liveLabel = null
+        if (liveLabel != null && !snapped && mode != Mode.GESTURE && mode != Mode.SWIPE) liveLabel = null
         if (snapped) main.postDelayed({ liveLabel = null; invalidateLive() }, 600)
         invalidateLive()
     }
@@ -1024,7 +991,7 @@ class BoardView(context: Context) : View(context) {
 
     fun cancelInput() {
         main.removeCallbacks(holdRunnable); main.removeCallbacks(longPressRunnable)
-        live.clear(); livePath.rewind(); shapePreview = null; toolDrag = null; liveLabel = null; hasPrediction = false
+        live.clear(); livePath.rewind(); liveLabel = null; hasPrediction = false
         if (mode == Mode.ERASE) endErase()
         mode = Mode.IDLE
         eraserCursorR = 0f
@@ -1087,74 +1054,6 @@ class BoardView(context: Context) : View(context) {
         invalidateLive()
         if (p != null && before != null && before !== p.strokes) pushOp(Op(p, before, p.strokes))
         invalidate()
-    }
-
-    // ---------------- 도형 도구
-
-    private fun buildShape(x0: Float, y0: Float, x1In: Float, y1In: Float): FloatArray? {
-        if (Geometry.distance(x0, y0, x1In, y1In) < 2f) return null
-        val u = currentPage?.unit ?: 30f
-        return when (shapeType) {
-            ShapeType.LINE, ShapeType.DASH_LINE -> {
-                val (x1, y1) = Geometry.snapAngle(x0, y0, x1In, y1In)
-                Geometry.line(x0, y0, x1, y1)
-            }
-            ShapeType.ARROW -> {
-                val (x1, y1) = Geometry.snapAngle(x0, y0, x1In, y1In)
-                Geometry.arrow(x0, y0, x1, y1, max(penWidthPage() * 4f, u * 0.5f))
-            }
-            ShapeType.RECT -> floatArrayOf(x0, y0, x1In, y0, x1In, y1In, x0, y1In, x0, y0)
-            ShapeType.ELLIPSE -> {
-                var rx = abs(x1In - x0) / 2f; var ry = abs(y1In - y0) / 2f
-                if (min(rx, ry) / max(rx, ry).coerceAtLeast(0.01f) > 0.9f) { val r = (rx + ry) / 2; rx = r; ry = r }
-                Geometry.ellipse((x0 + x1In) / 2f, (y0 + y1In) / 2f, rx, ry)
-            }
-            ShapeType.TRIANGLE -> floatArrayOf((x0 + x1In) / 2f, y0, x1In, y1In, x0, y1In, (x0 + x1In) / 2f, y0)
-            ShapeType.RIGHT_TRIANGLE -> floatArrayOf(x0, y0, x0, y1In, x1In, y1In, x0, y0)
-            ShapeType.AXES -> {
-                // 드래그한 사각형 안에 x, y 축 (중앙이 원점)
-                val l = min(x0, x1In); val r = max(x0, x1In); val t = min(y0, y1In); val b = max(y0, y1In)
-                val cx = (l + r) / 2f; val cy = (t + b) / 2f
-                val h = max(penWidthPage() * 4f, u * 0.4f)
-                val xa = Geometry.arrow(l, cy, r, cy, h)
-                val ya = Geometry.arrow(cx, b, cx, t, h)
-                // 하나의 연속 획: x축 → 원점으로 → y축 (이어그리기)
-                val out = FloatBuf()
-                for (i in xa.indices step 2) out.add(xa[i], xa[i + 1])
-                out.add(r, cy); out.add(cx, cy)
-                for (i in ya.indices step 2) out.add(ya[i], ya[i + 1])
-                out.toArray()
-            }
-            ShapeType.NUMBER_LINE -> {
-                // 수평 화살표 + 1단위 눈금
-                val l = min(x0, x1In); val r = max(x0, x1In)
-                val y = y0
-                val h = max(penWidthPage() * 4f, u * 0.4f)
-                val out = FloatBuf()
-                out.add(l, y)
-                var x = l + u
-                while (x < r - u * 0.5f) {
-                    out.add(x, y); out.add(x, y - u * 0.25f); out.add(x, y + u * 0.25f); out.add(x, y)
-                    x += u
-                }
-                val a = Geometry.arrow(l, y, r, y, h)
-                for (i in 2 until a.size step 2) out.add(a[i], a[i + 1])
-                out.toArray()
-            }
-        }
-    }
-
-    // ================================================================ 도구 보이기
-
-    /** 수학 도구를 현재 화면 가운데에 띄우거나 숨긴다 */
-    fun toggleTool(t: MathTool): Boolean {
-        if (t.visible) { t.visible = false; invalidateLive(); return false }
-        val p = currentPage ?: return false
-        val pp = toPage(width / 2f, (height - bottomInset) / 2f)
-        t.placeAt(pp[0], pp[1], p.unit)
-        t.visible = true
-        invalidateLive()
-        return true
     }
 
     // ================================================================ 썸네일

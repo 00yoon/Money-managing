@@ -18,7 +18,10 @@ object ShapeRecognizer {
 
     class Result(val name: String, val pts: FloatArray)
 
-    fun recognize(raw: FloatArray): Result? {
+    /**
+     * @param minCurve 부드러운 곡선 보정을 적용할 최소 크기(페이지 단위). 작은 글씨는 곡선 보정하지 않는다.
+     */
+    fun recognize(raw: FloatArray, minCurve: Float = 0f): Result? {
         val n = raw.size / 2
         if (n < 3) return null
         var minX = Float.MAX_VALUE; var minY = Float.MAX_VALUE; var maxX = -Float.MAX_VALUE; var maxY = -Float.MAX_VALUE
@@ -45,11 +48,13 @@ object ShapeRecognizer {
         val simple = rdp(raw, eps)
 
         if (!closed) {
-            // 열린 꺾은선 (2~3 개 선분) - 예: 각, 그래프 축
+            // 열린 획: 원호 / 꺾은선 / 부드러운 곡선 중 가장 잘 맞는 것
+            val arc = fitArc(raw, diag)
             val segs = simple.size / 2 - 1
-            if (segs in 2..3 && fitError(raw, simple, false) < diag * 0.035f) {
-                return Result("꺾은선", snapPolyline(simple))
-            }
+            val polyErr = if (segs in 2..3 && sharpCorners(simple)) fitError(raw, simple, false) else Float.MAX_VALUE
+            if (polyErr < diag * 0.035f && (arc == null || polyErr < arc.second)) return Result("꺾은선", snapPolyline(simple))
+            if (arc != null) return Result("원호", arc.first)
+            if (diag >= minCurve) smoothCurve(raw)?.let { return Result("곡선", it) }
             return null
         }
 
@@ -67,6 +72,128 @@ object ShapeRecognizer {
         }
         if (ell != null && ellErr < diag * 0.05f) return Result("원", ell.first)
         return null
+    }
+
+    /** 꺾은선의 모든 꺾임이 뚜렷한지 (완만한 곡선을 꺾은선으로 오인하지 않도록) */
+    private fun sharpCorners(p: FloatArray): Boolean {
+        val m = p.size / 2
+        for (k in 1 until m - 1) {
+            val a = p[k * 2 - 2] to p[k * 2 - 1]; val b = p[k * 2] to p[k * 2 + 1]; val c = p[k * 2 + 2] to p[k * 2 + 3]
+            if (angleAt(a, b, c) > 140.0) return false
+        }
+        return true
+    }
+
+    /** 원호 근사 (최소제곱 원). 성공하면 (호 좌표, 평균오차) */
+    private fun fitArc(raw: FloatArray, diag: Float): Pair<FloatArray, Float>? {
+        val n = raw.size / 2
+        // x² + y² + Dx + Ey + F = 0 의 최소제곱 해 (좌표를 평균 기준으로 옮겨 수치 안정성 확보)
+        var mx = 0.0; var my = 0.0
+        for (i in 0 until n) { mx += raw[i * 2]; my += raw[i * 2 + 1] }
+        mx /= n; my /= n
+        var sxx = 0.0; var sxy = 0.0; var syy = 0.0; var sx = 0.0; var sy = 0.0
+        var sxz = 0.0; var syz = 0.0; var sz = 0.0
+        for (i in 0 until n) {
+            val x = raw[i * 2] - mx; val y = raw[i * 2 + 1] - my; val z = x * x + y * y
+            sxx += x * x; sxy += x * y; syy += y * y; sx += x; sy += y
+            sxz += x * z; syz += y * z; sz += z
+        }
+        // [sxx sxy sx; sxy syy sy; sx sy n] [D E F]^T = -[sxz syz sz]^T
+        val a = arrayOf(doubleArrayOf(sxx, sxy, sx, -sxz), doubleArrayOf(sxy, syy, sy, -syz), doubleArrayOf(sx, sy, n.toDouble(), -sz))
+        val sol = solve3(a) ?: return null
+        val cx = -sol[0] / 2; val cy = -sol[1] / 2
+        val r2 = cx * cx + cy * cy - sol[2]
+        if (r2 <= 0) return null
+        val r = sqrt(r2)
+        if (r > diag * 2.5) return null      // 너무 완만 → 직선/곡선 쪽
+        var err = 0.0
+        for (i in 0 until n) err += abs(hypot(raw[i * 2] - mx - cx, raw[i * 2 + 1] - my - cy) - r)
+        err /= n
+        if (err > diag * 0.03) return null
+        // 진행 방향으로 각도 누적
+        var sweep = 0.0
+        var last = atan2(raw[1] - my - cy, raw[0] - mx - cx)
+        val a0 = last
+        for (i in 1 until n) {
+            val ang = atan2(raw[i * 2 + 1] - my - cy, raw[i * 2] - mx - cx)
+            var d = ang - last
+            while (d > Math.PI) d -= 2 * Math.PI
+            while (d < -Math.PI) d += 2 * Math.PI
+            sweep += d; last = ang
+        }
+        if (abs(sweep) < Math.toRadians(35.0) || abs(sweep) > Math.toRadians(330.0)) return null
+        val pts = Geometry.ellipse((cx + mx).toFloat(), (cy + my).toFloat(), r.toFloat(), r.toFloat(), 0f, a0, sweep)
+        return pts to err.toFloat()
+    }
+
+    private fun solve3(m: Array<DoubleArray>): DoubleArray? {
+        for (c in 0 until 3) {
+            var piv = c
+            for (r in c + 1 until 3) if (abs(m[r][c]) > abs(m[piv][c])) piv = r
+            if (abs(m[piv][c]) < 1e-9) return null
+            val t = m[c]; m[c] = m[piv]; m[piv] = t
+            for (r in 0 until 3) if (r != c) {
+                val f = m[r][c] / m[c][c]
+                for (k in c until 4) m[r][k] -= f * m[c][k]
+            }
+        }
+        return DoubleArray(3) { m[it][3] / m[it][it] }
+    }
+
+    /**
+     * 떨린 곡선을 매끈하게 (예: 포물선, 사인 곡선 그래프).
+     * 너무 많이 꺾이는 획(글씨, 낙서)은 건드리지 않는다.
+     */
+    private fun smoothCurve(raw: FloatArray): FloatArray? {
+        val pts = resample(raw, 64) ?: return null
+        val m = pts.size / 2
+        // 양 끝은 고정하고 여러 번 이웃 평균
+        var cur = pts
+        repeat(6) {
+            val nx = cur.copyOf()
+            for (k in 1 until m - 1) {
+                nx[k * 2] = (cur[k * 2 - 2] + 2 * cur[k * 2] + cur[k * 2 + 2]) / 4f
+                nx[k * 2 + 1] = (cur[k * 2 - 1] + 2 * cur[k * 2 + 1] + cur[k * 2 + 3]) / 4f
+            }
+            cur = nx
+        }
+        // 다듬은 뒤에도 총 회전각이 크면 글씨/낙서로 보고 보정하지 않음 (떨림은 위에서 걸러짐)
+        var turn = 0.0
+        for (k in 1 until m - 1) {
+            val a1 = atan2(cur[k * 2 + 1] - cur[k * 2 - 1], cur[k * 2] - cur[k * 2 - 2])
+            val a2 = atan2(cur[k * 2 + 3] - cur[k * 2 + 1], cur[k * 2 + 2] - cur[k * 2])
+            var d = (a2 - a1).toDouble()
+            while (d > Math.PI) d -= 2 * Math.PI
+            while (d < -Math.PI) d += 2 * Math.PI
+            turn += abs(d)
+        }
+        if (turn > Math.toRadians(420.0)) return null
+        return cur
+    }
+
+    /** 경로 길이 기준으로 n 개 점으로 균일 재표본화 */
+    private fun resample(raw: FloatArray, count: Int): FloatArray? {
+        val n = raw.size / 2
+        var total = 0f
+        for (i in 1 until n) total += hypot(raw[i * 2] - raw[i * 2 - 2], raw[i * 2 + 1] - raw[i * 2 - 1])
+        if (total <= 0f) return null
+        val step = total / (count - 1)
+        val out = FloatBuf(count * 2)
+        out.add(raw[0], raw[1])
+        var acc = 0f
+        var px = raw[0]; var py = raw[1]
+        var i = 1
+        while (i < n && out.points < count - 1) {
+            val qx = raw[i * 2]; val qy = raw[i * 2 + 1]
+            val d = hypot(qx - px, qy - py)
+            if (acc + d >= step && d > 0f) {
+                val t = (step - acc) / d
+                px += (qx - px) * t; py += (qy - py) * t
+                out.add(px, py); acc = 0f
+            } else { acc += d; px = qx; py = qy; i++ }
+        }
+        out.add(raw[n * 2 - 2], raw[n * 2 - 1])
+        return out.toArray()
     }
 
     // Ramer–Douglas–Peucker 단순화

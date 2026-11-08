@@ -49,9 +49,10 @@ class BoardActivity : Activity(), BoardView.Listener {
     private lateinit var pageLabel: TextView
     private lateinit var undoBtn: TextView
     private lateinit var redoBtn: TextView
-    private lateinit var rulerBtn: TextView
-    private lateinit var protBtn: TextView
-    private lateinit var compassBtn: TextView
+    // 접힌 상태에서 오른쪽 아래에 보이는 작은 버튼
+    private lateinit var handle: LinearLayout
+    private lateinit var handleDot: View
+    private lateinit var handleText: TextView
 
     private val quickColors = intArrayOf(Color.BLACK, Color.rgb(224, 49, 49), Color.rgb(25, 113, 194), Color.rgb(47, 158, 68), Color.rgb(247, 103, 7), Color.WHITE)
     private val moreColors = intArrayOf(
@@ -140,8 +141,7 @@ class BoardActivity : Activity(), BoardView.Listener {
         val pen = Ui.button(this, "✎ 펜") { selectTool(Tool.PEN) }
         val hl = Ui.button(this, "▍형광펜") { selectTool(Tool.HIGHLIGHTER) }
         val er = Ui.button(this, "⌫ 지우개") { selectTool(Tool.ERASER) }
-        val sh = Ui.button(this, "△ 도형") { selectTool(Tool.SHAPE) }
-        toolButtons = mapOf(Tool.PEN to pen, Tool.HIGHLIGHTER to hl, Tool.ERASER to er, Tool.SHAPE to sh)
+        toolButtons = mapOf(Tool.PEN to pen, Tool.HIGHLIGHTER to hl, Tool.ERASER to er)
         toolButtons.values.forEach { bar.addView(it) }
         bar.addView(Ui.divider(this))
 
@@ -149,12 +149,6 @@ class BoardActivity : Activity(), BoardView.Listener {
             val dot = Ui.colorDot(this, c) { v -> applyColor(v.tag as Int) }
             colorDots += dot; bar.addView(dot)
         }
-        bar.addView(Ui.divider(this))
-
-        rulerBtn = Ui.button(this, "📏 자") { Ui.setSelected(rulerBtn, board.toggleTool(board.ruler)) }
-        protBtn = Ui.button(this, "◠ 각도기") { Ui.setSelected(protBtn, board.toggleTool(board.protractor)) }
-        compassBtn = Ui.button(this, "⊙ 컴퍼스") { Ui.setSelected(compassBtn, board.toggleTool(board.compass)) }
-        bar.addView(rulerBtn); bar.addView(protBtn); bar.addView(compassBtn)
         bar.addView(Ui.divider(this))
 
         undoBtn = Ui.button(this, "↶", 24f) { board.undo() }
@@ -176,27 +170,66 @@ class BoardActivity : Activity(), BoardView.Listener {
         val more = Ui.button(this, "⋯", 24f) {}
         more.setOnClickListener { showMenu(it) }
         bar.addView(more)
+        bar.addView(Ui.divider(this))
+        bar.addView(Ui.button(this, "▾ 접기") { collapseToolbar() })
 
+        // 펼친 툴바: 오른쪽 아래 기준
+        (subScroll.layoutParams as LinearLayout.LayoutParams).gravity = Gravity.END
+        (barScroll.layoutParams as LinearLayout.LayoutParams).gravity = Gravity.END
         root.addView(barWrap, FrameLayout.LayoutParams(-2, -2).apply {
-            gravity = Gravity.BOTTOM or toolbarGravity()
+            gravity = Gravity.BOTTOM or Gravity.END
             val m = Ui.dpi(this@BoardActivity, 12f); setMargins(m, m, m, m)
         })
-        barWrap.addOnLayoutChangeListener { _, _, _, _, _, _, _, _, _ ->
-            board.bottomInset = barScroll.height + Ui.dpi(this, 20f)
+        barWrap.visibility = View.GONE
+
+        // 접힌 상태: 오른쪽 아래 작은 버튼 (현재 색 + 쪽 번호). 누르면 툴바 펼침.
+        handleDot = View(this).apply { layoutParams = LinearLayout.LayoutParams(Ui.dpi(context, 30f), Ui.dpi(context, 30f)) }
+        handleText = TextView(this).apply {
+            textSize = 18f; setTextColor(Ui.TEXT)
+            setPadding(Ui.dpi(context, 10f), 0, Ui.dpi(context, 4f), 0)
         }
+        handle = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL
+            val p = Ui.dpi(context, 14f); setPadding(p, 0, p, 0)
+            minimumHeight = Ui.dpi(context, 64f)
+            background = Ui.rounded(0xEEFFFFFF.toInt(), Ui.dp(context, 32f), Ui.dpi(context, 1f), 0xFFADB5BD.toInt())
+            elevation = Ui.dp(context, 8f)
+            addView(handleDot); addView(handleText)
+            addView(TextView(context).apply { text = "  ☰"; textSize = 22f; setTextColor(Ui.TEXT) })
+            setOnClickListener { expandToolbar() }
+        }
+        root.addView(handle, FrameLayout.LayoutParams(-2, Ui.dpi(this, 64f)).apply {
+            gravity = Gravity.BOTTOM or Gravity.END
+            val m = Ui.dpi(this@BoardActivity, 16f); setMargins(m, m, m, m)
+        })
+        board.bottomInset = 0   // 툴바가 접혀 있으므로 페이지는 화면 전체를 씀
 
         selectTool(Tool.PEN)
     }
 
-    private fun toolbarGravity() = when (board.prefs.toolbarPos) { 0 -> Gravity.START; 2 -> Gravity.END; else -> Gravity.CENTER_HORIZONTAL }
+    private fun expandToolbar() {
+        dismissQuickMenu()
+        barWrap.visibility = View.VISIBLE
+        handle.visibility = View.GONE
+    }
 
-    private fun setToolbarPos(pos: Int) {
-        board.prefs.toolbarPos = pos
-        val lp = barWrap.layoutParams as FrameLayout.LayoutParams
-        lp.gravity = Gravity.BOTTOM or toolbarGravity()
-        barWrap.layoutParams = lp
-        (subScroll.layoutParams as LinearLayout.LayoutParams).gravity = toolbarGravity()
-        subScroll.requestLayout()
+    private fun collapseToolbar() {
+        subScroll.visibility = View.GONE
+        barWrap.visibility = View.GONE
+        handle.visibility = View.VISIBLE
+        refreshHandle()
+    }
+
+    /** 접힌 버튼에 현재 도구 색과 쪽 번호 표시 */
+    private fun refreshHandle() {
+        if (!::handleDot.isInitialized) return
+        val color = when (board.tool) { Tool.HIGHLIGHTER -> board.hlColor; Tool.ERASER -> Color.TRANSPARENT; else -> board.penColor }
+        handleDot.background = android.graphics.drawable.GradientDrawable().apply {
+            shape = android.graphics.drawable.GradientDrawable.OVAL
+            setColor(color); setStroke(Ui.dpi(this@BoardActivity, 2f), 0xFF868E96.toInt())
+        }
+        val tool = when (board.tool) { Tool.PEN -> "✎"; Tool.HIGHLIGHTER -> "▍"; Tool.ERASER -> "⌫" }
+        handleText.text = if (board.pageCount > 0) "$tool  ${board.pageIndex + 1} / ${board.pageCount}" else tool
     }
 
     private fun selectTool(t: Tool) {
@@ -205,13 +238,9 @@ class BoardActivity : Activity(), BoardView.Listener {
         board.tool = t
         toolButtons.forEach { (k, v) -> Ui.setSelected(v, k == t) }
         refreshColorDots()
-        // 같은 도구를 한 번 더 누르면 세부 설정 패널 열기/닫기. 도형은 항상 종류 선택 표시.
-        when {
-            t == Tool.SHAPE -> showSubPanel(t)
-            again -> showSubPanel(t)
-            wasSame -> subScroll.visibility = View.GONE
-            else -> subScroll.visibility = View.GONE
-        }
+        // 같은 도구를 한 번 더 누르면 세부 설정 패널 열기/닫기
+        if (again) showSubPanel(t) else subScroll.visibility = View.GONE
+        refreshHandle()
     }
 
     private fun applyColor(c: Int) {
@@ -221,6 +250,7 @@ class BoardActivity : Activity(), BoardView.Listener {
             if (board.tool == Tool.ERASER) selectTool(Tool.PEN)
         }
         refreshColorDots()
+        refreshHandle()
         if (subScroll.visibility == View.VISIBLE) showSubPanel(board.tool)
     }
 
@@ -232,23 +262,14 @@ class BoardActivity : Activity(), BoardView.Listener {
     private fun showSubPanel(t: Tool) {
         subPanel.removeAllViews()
         when (t) {
-            Tool.PEN, Tool.SHAPE -> {
-                if (t == Tool.SHAPE) {
-                    val btns = ArrayList<TextView>()
-                    for (st in ShapeType.values()) {
-                        val b = Ui.button(this, st.label) { board.shapeType = st; btns.forEach { Ui.setSelected(it, it.tag == st) } }
-                        b.tag = st; Ui.setSelected(b, board.shapeType == st)
-                        btns += b; subPanel.addView(b)
-                    }
-                    subPanel.addView(Ui.divider(this))
-                }
+            Tool.PEN -> {
                 addWidthButtons(floatArrayOf(2f, 4f, 7f, 12f, 20f), board.penWidthPx) { board.penWidthPx = it; board.prefs.penWidth = it }
                 subPanel.addView(Ui.divider(this))
                 val dash = Ui.button(this, "┅ 점선") {}
                 Ui.setSelected(dash, board.dashed)
                 dash.setOnClickListener { board.dashed = !board.dashed; Ui.setSelected(dash, board.dashed) }
                 subPanel.addView(dash)
-                if (t == Tool.PEN) {
+                run {
                     subPanel.addView(Ui.divider(this))
                     for (c in moreColors) {
                         val d = Ui.colorDot(this, c) { v -> applyColor(v.tag as Int) }
@@ -321,9 +342,6 @@ class BoardActivity : Activity(), BoardView.Listener {
         m.add(0, 4, 0, if (board.fitWidth) "화면 맞춤: 쪽 전체로" else "화면 맞춤: 폭에 맞추기")
         m.add(0, 5, 0, "모든 획 자동 도형 보정").apply { isCheckable = true; isChecked = board.prefs.autoShape }
         m.add(0, 6, 0, "멈추면 도형 보정").apply { isCheckable = true; isChecked = board.prefs.holdToSnap }
-        m.add(0, 7, 0, "툴바 위치: 왼쪽")
-        m.add(0, 8, 0, "툴바 위치: 가운데")
-        m.add(0, 9, 0, "툴바 위치: 오른쪽")
         m.add(0, 10, 0, "설정 (손바닥 지우개 등)")
         pm.setOnMenuItemClickListener { item ->
             when (item.itemId) {
@@ -335,9 +353,6 @@ class BoardActivity : Activity(), BoardView.Listener {
                 4 -> board.setFitWidth(!board.fitWidth)
                 5 -> board.prefs.autoShape = !board.prefs.autoShape
                 6 -> board.prefs.holdToSnap = !board.prefs.holdToSnap
-                7 -> setToolbarPos(0)
-                8 -> setToolbarPos(1)
-                9 -> setToolbarPos(2)
                 10 -> startActivity(Intent(this, SettingsActivity::class.java))
             }
             true
@@ -437,6 +452,7 @@ class BoardActivity : Activity(), BoardView.Listener {
 
     override fun onPageChanged(index: Int, count: Int) {
         pageLabel.text = "${index + 1} / $count"
+        refreshHandle()
         scheduleSave()
     }
 
@@ -446,6 +462,11 @@ class BoardActivity : Activity(), BoardView.Listener {
     }
 
     override fun onDocChanged() = scheduleSave()
+
+    /** 판서를 시작하면 툴바 자동 접기 */
+    override fun onTouchStart() {
+        if (barWrap.visibility == View.VISIBLE) collapseToolbar()
+    }
 
     override fun onMessage(msg: String) { Toast.makeText(this, msg, Toast.LENGTH_SHORT).show() }
 
@@ -476,7 +497,7 @@ class BoardActivity : Activity(), BoardView.Listener {
         val dotColors = if (board.tool == Tool.HIGHLIGHTER) hlColors else quickMenuColors
         for (c in dotColors) {
             val d = Ui.colorDot(this, c) { v ->
-                if (board.tool != Tool.HIGHLIGHTER && board.tool != Tool.SHAPE) selectTool(Tool.PEN)
+                if (board.tool != Tool.HIGHLIGHTER) selectTool(Tool.PEN)
                 applyColor(v.tag as Int); dismissQuickMenu()
             }
             val sz = Ui.dpi(this, 60f)
@@ -495,7 +516,7 @@ class BoardActivity : Activity(), BoardView.Listener {
         tb("🗑 전체 지우기", false) { board.clearPage() }
         panel.addView(tools)
         // 3줄: 굵기
-        if (board.tool == Tool.PEN || board.tool == Tool.SHAPE) {
+        if (board.tool == Tool.PEN) {
             val widths = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER }
             for ((label, w) in listOf("가늘게" to 2.5f, "보통" to 4f, "굵게" to 7f, "아주 굵게" to 12f)) {
                 val b = Ui.button(this, label, 16f) { board.penWidthPx = w; board.prefs.penWidth = w; dismissQuickMenu() }

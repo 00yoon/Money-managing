@@ -62,4 +62,31 @@ class ShapeRecognizerTest {
         val r = ShapeRecognizer.recognize(polyStroke(100f, 100f, 100f, 400f, 400f, 402f))
         assertEquals("꺾은선", r?.name)
     }
+
+    @Test fun arc() {
+        val out = FloatBuf()
+        for (i in 0..60) {
+            val a = PI * i / 60   // 반원
+            out.add((300 + 150 * cos(a)).toFloat() + jitter(3f), (300 - 150 * sin(a)).toFloat() + jitter(3f))
+        }
+        assertEquals("원호", ShapeRecognizer.recognize(out.toArray())?.name)
+    }
+
+    @Test fun parabolaBecomesSmoothCurve() {
+        val out = FloatBuf()
+        for (i in -40..40) {
+            val x = i * 5f
+            out.add(300 + x + jitter(2f), 100 + x * x / 100f + jitter(4f))
+        }
+        val r = ShapeRecognizer.recognize(out.toArray(), 50f)
+        assertEquals("곡선", r?.name)
+        assertEquals(out.x(0), r!!.pts[0], 0.01f)   // 끝점은 그대로
+    }
+
+    @Test fun smallStrokeNotCurved() {
+        val out = FloatBuf()
+        for (i in -10..10) out.add(30 + i * 1f + jitter(0.5f), 10 + i * i / 10f + jitter(0.5f))
+        val r = ShapeRecognizer.recognize(out.toArray(), 200f)
+        assert(r?.name != "곡선")
+    }
 }
