@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <style name="AppTheme" parent="android:Theme.Material.Light.NoActionBar">
+        <item name="android:colorPrimary">#1E5BB8</item>
+        <item name="android:colorPrimaryDark">#163F7F</item>
+        <item name="android:colorAccent">#E8590C</item>
+        <item name="android:windowBackground">#F1F3F5</item>
+    </style>
+</resources>

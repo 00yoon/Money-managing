@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp" android:height="108dp"
+    android:viewportWidth="108" android:viewportHeight="108">
+    <!-- 칠판 -->
+    <path android:fillColor="#FFFFFF" android:pathData="M28,34h52v36h-52z" android:fillAlpha="0.15"/>
+    <path android:strokeColor="#FFFFFF" android:strokeWidth="3" android:pathData="M28,34h52v36h-52z"/>
+    <!-- 판서 곡선 -->
+    <path android:strokeColor="#FFD43B" android:strokeWidth="3.5" android:strokeLineCap="round"
+        android:pathData="M34,60 C40,44 46,44 50,56 S60,66 66,46"/>
+    <!-- 펜 -->
+    <path android:fillColor="#FFFFFF" android:pathData="M70,62 l10,-10 l4,4 l-10,10 l-6,2 z"/>
+    <path android:strokeColor="#FFFFFF" android:strokeWidth="3" android:strokeLineCap="round" android:pathData="M48,78 h12"/>
+</vector>
